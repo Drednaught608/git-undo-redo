@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>git-undo-redo - editor-style undo & redo for Git</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg" />
+<meta name="description" content="Operation-level undo/redo for Git: git undo reverses your last operation (commit, merge, rebase, reset, checkout) and git redo puts it back. Append-only oplog, nothing lost. One command to install on macOS, Linux, Windows." />
+<script>
+  /* Apply a saved explicit theme before paint so there's no flash. "auto" (or
+     unset) leaves it to the OS via prefers-color-scheme. */
+  (function () {
+    try {
+      var t = localStorage.getItem('gur-theme');
+      if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  /* Light is the default. Dark applies when the OS prefers it (auto) OR when
+     the user explicitly picks dark; an explicit "light"/"dark" choice (set as
+     data-theme on <html>, remembered in localStorage) always wins over the OS. */
+  :root {
+    --bg: #ffffff;
+    --bg-alt: #f7f7fa;
+    --ink: #0b0b12;
+    --muted: #5b5b70;
+    --line: #e9e9f0;
+    --line-strong: #d9d9e4;
+    --surface: #ffffff;
+    --header-bg: rgba(255,255,255,0.82);
+    --chip-bg: #f1eeff;
+    --chip-border: #e4ddff;
+    --term-bg: #14151c;
+    --term-line: #23242f;
+    --accent: #fe315d;
+    --accent-2: #7b61ff;
+    --grad: linear-gradient(120deg, #fe315d 0%, #ff4d8d 38%, #7b61ff 100%);
+    --radius: 16px;
+    --maxw: 1080px;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0c0d12; --bg-alt: #14151b; --ink: #e9ebf2; --muted: #9da0b5;
+    --line: #24262f; --line-strong: #34384a; --surface: #15171f;
+    --header-bg: rgba(12,13,18,0.82); --chip-bg: #1c1733; --chip-border: #2c2550;
+    --term-bg: #14151c; --term-line: #2a2c38;
+    --accent: #ff5277; --accent-2: #9a82ff;
+    --grad: linear-gradient(120deg, #ff5277 0%, #ff6f9c 38%, #9a82ff 100%);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+      --bg: #0c0d12; --bg-alt: #14151b; --ink: #e9ebf2; --muted: #9da0b5;
+      --line: #24262f; --line-strong: #34384a; --surface: #15171f;
+      --header-bg: rgba(12,13,18,0.82); --chip-bg: #1c1733; --chip-border: #2c2550;
+      --term-bg: #14151c; --term-line: #2a2c38;
+      --accent: #ff5277; --accent-2: #9a82ff;
+      --grad: linear-gradient(120deg, #ff5277 0%, #ff6f9c 38%, #9a82ff 100%);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    transition: background-color .2s ease, color .2s ease;
+  }
+  a { color: inherit; }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  /* ---- nav ---- */
+  header {
+    position: sticky; top: 0; z-index: 30;
+    backdrop-filter: saturate(1.4) blur(10px);
+    background: var(--header-bg);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: -0.02em; font-size: 17px; }
+  .brand .logo { width: 24px; height: 24px; display: block; }
+  .nav-links { display: flex; align-items: center; gap: 22px; font-weight: 600; font-size: 14px; }
+  .nav-links a { text-decoration: none; color: var(--muted); transition: color .15s; }
+  .nav-links a:hover { color: var(--ink); }
+  .ghbtn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--surface); font-weight: 700; font-size: 14px; text-decoration: none;
+    transition: border-color .15s, transform .1s;
+  }
+  .ghbtn:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+  /* segmented theme control: Light │ Auto │ Dark */
+  .themeseg {
+    display: inline-flex; align-items: stretch;
+    border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: var(--surface);
+  }
+  .themeseg button {
+    border: 0; background: transparent; color: var(--muted);
+    font: inherit; font-size: 14px; line-height: 1; cursor: pointer;
+    padding: 7px 11px; transition: background-color .15s, color .15s;
+  }
+  .themeseg button + button { border-left: 1px solid var(--line); }
+  .themeseg button:hover { color: var(--ink); }
+  .themeseg button[aria-pressed="true"] { background: var(--chip-bg); color: var(--accent-2); }
+
+  /* ---- hero ---- */
+  .hero { padding: 88px 0 56px; position: relative; overflow: hidden; }
+  .hero::before {
+    content: ""; position: absolute; inset: -40% 20% auto -10%; height: 520px;
+    background: radial-gradient(60% 60% at 30% 30%, rgba(254,49,93,0.10), transparent 70%),
+                radial-gradient(50% 50% at 80% 20%, rgba(123,97,255,0.12), transparent 70%);
+    filter: blur(8px); z-index: -1;
+  }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 700; letter-spacing: .02em; color: var(--accent-2);
+    background: var(--chip-bg); border: 1px solid var(--chip-border); padding: 6px 12px; border-radius: 999px;
+    margin-bottom: 22px;
+  }
+  h1 {
+    font-size: clamp(38px, 6vw, 68px); line-height: 1.02; letter-spacing: -0.035em;
+    font-weight: 900; margin: 0 0 20px; max-width: 16ch;
+  }
+  h1 .g { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .sub { font-size: clamp(17px, 2.2vw, 21px); color: var(--muted); max-width: 56ch; margin: 0 0 34px; font-weight: 450; }
+
+  /* ---- install command ---- */
+  .install { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  .cmd {
+    display: flex; align-items: stretch; background: var(--term-bg); border-radius: 12px;
+    overflow: hidden; box-shadow: 0 14px 40px -18px rgba(11,11,18,.5); max-width: 100%;
+  }
+  .cmd .prompt { color: #ff7aa3; padding: 0 4px 0 18px; display: flex; align-items: center; font-family:'JetBrains Mono',monospace; font-weight:700; }
+  .cmd code { color: #eef0f6; padding: 16px 18px 16px 6px; font-size: 14px; white-space: nowrap; overflow-x: auto; }
+  .copy {
+    border: none; border-left: 1px solid var(--term-line); background: #1c1d27; color: #cdd0dc;
+    font-weight: 700; font-size: 13px; padding: 0 18px; cursor: pointer; font-family: 'Inter', sans-serif;
+    transition: background .15s, color .15s; display: flex; align-items: center; gap: 7px;
+  }
+  .copy:hover { background: #262838; color: #fff; }
+  .copy.ok { color: #57e389; }
+  .cta {
+    display: inline-flex; align-items: center; gap: 9px; text-decoration: none;
+    background: var(--ink); color: var(--bg); font-weight: 700; font-size: 15px;
+    padding: 14px 22px; border-radius: 12px; transition: transform .1s, box-shadow .2s;
+  }
+  .cta:hover { transform: translateY(-2px); box-shadow: 0 12px 30px -12px rgba(11,11,18,.6); }
+  .hint { margin-top: 14px; font-size: 13.5px; color: var(--muted); }
+  .hint code { background: var(--bg-alt); padding: 2px 6px; border-radius: 6px; font-size: 12.5px; }
+
+  /* ---- terminal demo ---- */
+  .demo { margin-top: 56px; }
+  .term {
+    background: var(--term-bg); border-radius: var(--radius); border: 1px solid var(--term-line);
+    box-shadow: 0 30px 80px -30px rgba(11,11,18,.55); overflow: hidden;
+  }
+  .term-bar { display: flex; align-items: center; gap: 8px; padding: 13px 16px; border-bottom: 1px solid var(--term-line); }
+  .term-bar .b { width: 12px; height: 12px; border-radius: 50%; }
+  .term-bar .b:nth-child(1){ background:#ff5f57;} .term-bar .b:nth-child(2){ background:#febc2e;} .term-bar .b:nth-child(3){ background:#28c840;}
+  .term-bar .ttl { margin-left: 10px; color: #71748a; font-size: 12.5px; font-family:'JetBrains Mono',monospace; }
+  .term pre {
+    margin: 0; padding: 22px 24px; color: #dfe2ec; font-size: 13.5px; line-height: 1.85;
+    overflow-x: auto; tab-size: 2;
+  }
+  .term .p  { color: #ff7aa3; font-weight: 700; }
+  .term .c  { color: #7e8298; }
+  .term .u  { color: #ff6f9c; }
+  .term .r  { color: #8e7bff; }
+  .term .at { color: #57e389; font-weight: 700; }
+  .term .k  { color: #f5c451; }
+  .term .dim{ color: #9a9db4; }
+  .term .ok { color: #57e389; }
+
+  /* ---- sections ---- */
+  section { padding: 84px 0; }
+  .alt { background: var(--bg-alt); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .lede { max-width: 60ch; margin-bottom: 52px; }
+  .lede h2 { font-size: clamp(28px, 4vw, 40px); letter-spacing: -0.03em; font-weight: 850; margin: 0 0 16px; }
+  .lede p { font-size: 18px; color: var(--muted); margin: 0; }
+  .kicker { font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 14px; }
+
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 26px;
+    transition: transform .14s, border-color .14s, box-shadow .2s;
+  }
+  .card:hover { transform: translateY(-3px); border-color: var(--line-strong); box-shadow: 0 18px 40px -24px rgba(11,11,18,.35); }
+  .card .ic { width: 40px; height: 40px; border-radius: 11px; background: var(--grad); margin-bottom: 16px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:800; font-size:18px; }
+  .card h3 { margin: 0 0 8px; font-size: 18px; letter-spacing: -0.01em; }
+  .card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+
+  /* ---- commands ---- */
+  .cmds { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .crow {
+    display: grid; grid-template-columns: 200px 1fr; gap: 18px; align-items: start;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px;
+  }
+  .crow .name { font-family:'JetBrains Mono',monospace; font-weight: 700; font-size: 15px; color: var(--ink); }
+  .crow .name b { color: var(--accent-2); }
+  .crow .desc { color: var(--muted); font-size: 14.5px; }
+
+  /* ---- how it works ---- */
+  .how { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 48px; align-items: center; }
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 20px; }
+  .steps li { display: flex; gap: 16px; }
+  .steps .n { flex: 0 0 30px; height: 30px; border-radius: 9px; background: var(--chip-bg); color: var(--accent-2); font-weight: 800; display:flex; align-items:center; justify-content:center; font-size: 14px; }
+  .steps h4 { margin: 2px 0 4px; font-size: 16px; }
+  .steps p { margin: 0; color: var(--muted); font-size: 14.5px; }
+
+  /* ---- footer ---- */
+  footer { padding: 56px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  .foot { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; justify-content: space-between; }
+  .foot a { color: var(--ink); font-weight: 600; text-decoration: none; }
+  .foot a:hover { color: var(--accent); }
+  .badges { display:flex; gap:10px; flex-wrap:wrap; }
+  .badge { font-size:12.5px; font-weight:700; color: var(--muted); background:var(--surface); border:1px solid var(--line); padding:6px 12px; border-radius:999px; }
+
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .cmds { grid-template-columns: 1fr; }
+    .how { grid-template-columns: 1fr; gap: 32px; }
+    .crow { grid-template-columns: 1fr; gap: 6px; }
+    .nav-links a:not(.ghbtn) { display: none; }
+  }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <div class="brand"><img class="logo" src="logo.svg" alt="" width="24" height="24"> git-undo-redo</div>
+    <nav class="nav-links">
+      <a href="#why">Why</a>
+      <a href="#commands">Commands</a>
+      <a href="#how">How it works</a>
+      <div id="theme-seg" class="themeseg" role="group" aria-label="Color theme">
+        <button type="button" data-mode="light" title="Light theme" aria-label="Light theme">☀</button>
+        <button type="button" data-mode="auto"  title="Auto (match system)" aria-label="Auto theme">◐</button>
+        <button type="button" data-mode="dark"  title="Dark theme" aria-label="Dark theme">☾</button>
+      </div>
+      <a class="ghbtn" href="https://github.com/Drednaught608/git-undo-redo">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38l-.01-1.49c-2.01.37-2.53-.49-2.7-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48l-.01 2.2c0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="wrap">
+    <span class="eyebrow">↶ ↷ &nbsp;Undo/redo that behaves like an editor</span>
+    <h1>Undo and redo for Git, <span class="g">the way your editor does it.</span></h1>
+    <p class="sub">Reverse your last Git <em>operation</em> (commit, merge, rebase, reset, branch-switch checkout, whatever it was) with a single <code>git undo</code>, and <code>git redo</code> to put it back. It keeps its own append-only operation log, inspired by Jujutsu, so nothing you undo past is ever lost.</p>
+
+    <div class="install">
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code id="cmd">curl -fsSL https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/install.sh | bash</code>
+        <button class="copy" id="copy" aria-label="Copy install command">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M10 1H4a2 2 0 0 0-2 2v7h2V3h6V1Zm2 3H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Zm0 10H7V6h5v8Z"/></svg>
+          <span id="copytxt">Copy</span>
+        </button>
+      </div>
+      <a class="cta" href="https://github.com/Drednaught608/git-undo-redo">Get it on GitHub →</a>
+    </div>
+    <p class="hint">Works on macOS, Linux, and Windows. On Windows you only need <strong>Git for Windows</strong> - <code>git undo</code> runs from PowerShell too, not just Git-Bash.</p>
+
+    <!-- TERMINAL DEMO -->
+    <div class="demo">
+      <div class="term">
+        <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">~/project - undo & redo in action</span></div>
+<pre><span class="p">$</span> git reset --hard HEAD~2   <span class="c"># oops, lost two commits</span>
+
+<span class="p">$</span> git undo
+<span class="u">↶ Undo (reset) →</span> a1b2c3d Add login form  <span class="dim">(undo: 4 · redo: 1)</span>
+
+<span class="p">$</span> git redo
+<span class="r">↷ Redo (reset) →</span> 7e2b9c0 Scaffold routes  <span class="dim">(undo: 5 · redo: 0)</span>
+
+<span class="p">$</span> git oplog
+Global operation log <span class="c">(newest first; @ = current position)</span>:
+       5  <span class="k">reset</span>    7e2b9c0 Scaffold routes
+ <span class="at">@</span>     4  <span class="u">commit</span>   a1b2c3d Add login form
+       3  <span class="r">commit′</span>  9c0ffee Refactor parser   <span class="c">← prime mark (′): the state you resumed from</span>
+       2  <span class="k">commit</span>   9c0ffee Refactor parser
+       1  <span class="k">commit</span>   1b2c3d4 Initial parser</pre>
+      </div>
+      <div class="term" style="margin-top:18px">
+        <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">~/project - committed too early? keep the changes</span></div>
+<pre><span class="p">$</span> git commit -m "wip: half-done refactor"   <span class="c"># oops, not ready</span>
+
+<span class="p">$</span> git undo -s   <span class="c"># undo, but keep its changes staged to edit &amp; re-commit</span>
+<span class="u">↶ Undo (commit) →</span> 9d902ce Wire up validation  <span class="dim">(undo: 1 · redo: 1)</span>
+   <span class="ok">↥ staged the changes from 62e6931 wip: half-done refactor</span> - edit and re-commit
+
+<span class="c"># (or, if you already ran a plain 'git undo' and only then realized:)</span>
+<span class="p">$</span> git take
+<span class="ok">↥ Took the changes from 62e6931 wip: half-done refactor</span> - staged onto 9d902ce Wire up validation, edit and commit.</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- WHY -->
+<section id="why" class="alt">
+  <div class="wrap">
+    <div class="lede">
+      <p class="kicker">Why it's different</p>
+      <h2>Undo the <em>operation</em>, not just the commit.</h2>
+      <p>Most "git undo" tricks only peel back commits. This reverses whatever you actually did (a bad reset, a wrong rebase, a stray checkout) by reading them from git's own operation record, with the tool's own hops stripped out.</p>
+    </div>
+    <div class="grid">
+      <div class="card"><div class="ic">↶</div><h3>Reverses any operation</h3><p>Commit, merge, rebase, reset, branch-switch - <code>git undo</code> steps back one real operation. It's branch-aware: every state remembers the branch it was on, so you land back on that branch (recreated if you'd deleted it). It never detaches HEAD.</p></div>
+      <div class="card"><div class="ic">∞</div><h3>Append-only, nothing lost</h3><p>Undo then act, and what you undid past stays in the log behind a prime anchor - you can keep walking back to it. The oplog only ever grows.</p></div>
+      <div class="card"><div class="ic">⊞</div><h3>An orthogonal oplog</h3><p>All tracking lives in its own space inside <code>.git</code>. Your branches and refs stay pristine - nothing leaks into <code>refs/heads</code> or your tags.</p></div>
+      <div class="card"><div class="ic">✓</div><h3>Your reflog stays clean</h3><p>It only writes clearly labeled <code>git-undo:</code> / <code>git-redo:</code> entries and never reads the reflog to navigate - so <code>git reflog</code> stays an honest backstop.</p></div>
+      <div class="card"><div class="ic">⛉</div><h3>GC-proof</h3><p>Every state it has ever seen gets a keep-ref, so git's garbage collector can never reclaim an undone or abandoned commit.</p></div>
+      <div class="card"><div class="ic">◇</div><h3>Works everywhere</h3><p>One bash script, one installer. macOS, Linux, and Windows (Git for Windows or WSL) - the same command on all of them.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- COMMANDS -->
+<section id="commands">
+  <div class="wrap">
+    <div class="lede">
+      <p class="kicker">A small, obvious surface</p>
+      <h2>Five commands, a handful of flags.</h2>
+      <p>Two verbs you'll use constantly, two for looking around, one to grab a commit's changes. Every command takes <code>-h</code> for help (use <code>-h</code>, not <code>--help</code>: git reserves <code>git &lt;cmd&gt; --help</code> for its own manual pages).</p>
+    </div>
+    <div class="cmds">
+      <div class="crow"><div class="name">git <b>undo</b></div><div class="desc">Reverse your last operation (commit, merge, rebase, reset, branch switch). Global by default.</div></div>
+      <div class="crow"><div class="name">git undo <b>-l</b>, <b>--local</b></div><div class="desc">Undo the last edit on the branch you're currently on, using that branch's own log. Stays on your branch; switch anywhere and undo its last edit without being pulled away. (<span class="mono">-g</span>/<span class="mono">--global</span> forces the shared-log undo.)</div></div>
+      <div class="crow"><div class="name">git <b>redo</b></div><div class="desc">Re-apply an operation you undid (<span class="mono">-l</span> for the current branch's edits).</div></div>
+      <div class="crow"><div class="name">git undo <b>N</b> · git redo <b>N</b></div><div class="desc">Do N steps at once, e.g. <span class="mono">git undo 3</span>. Refuses and tells you how many are available if N is too many. Combines with <span class="mono">-g</span>/<span class="mono">-l</span>.</div></div>
+      <div class="crow"><div class="name">git undo <b>-s</b>, <b>--staged</b></div><div class="desc">Undo, but leave the commit directly above you <em>staged</em> instead of removing its changes - the "committed too early, let me edit and re-commit" flow. Works on <span class="mono">git redo</span> too.</div></div>
+      <div class="crow"><div class="name">git <b>oplog</b></div><div class="desc">Show the log, newest first, with <span class="mono">@</span> marking where you are. <span class="mono">-g</span> (default) shows the shared log, <span class="mono">-l</span> the current branch's edits. <span class="mono">-c</span> hides prime anchors (<span class="mono">-f</span>, the default, shows them); <span class="mono">-i</span> drops you to a point you pick (<span class="mono">t</span> toggles the view).</div></div>
+      <div class="crow"><div class="name">git oplog <b>--reset</b></div><div class="desc">Drop the tracked oplog so it rebuilds cleanly from git's reflog (a rebuild, not a wipe - recent history stitches back). Your commits and files are untouched.</div></div>
+      <div class="crow"><div class="name">git <b>opstatus</b></div><div class="desc">Show the current HEAD and how many undo / redo steps remain, for the shared log (<span class="mono">-g</span>, default) or the current branch's edits (<span class="mono">-l</span>).</div></div>
+      <div class="crow"><div class="name">git <b>take</b> · git take <b>N</b></div><div class="desc">Stage the changes from the commit above your current point <em>without moving</em> - the after-the-fact version of <span class="mono">--staged</span>, for when you undid and forgot it. <span class="mono">git take N</span> reaches N commits up in one shot. Edit-based; needs a clean tree and a branch.</div></div>
+    </div>
+    <p class="hint" style="margin-top:18px"><code>git config undoredo.default global|local</code> sets the default scope for <code>undo</code>, <code>redo</code>, <code>oplog</code>, and <code>opstatus</code>; <code>git config undoredo.oplog full|compact</code> sets the default oplog view; <code>git config undoredo.color auto|always|never</code> controls color (auto = only to a terminal). Flags always override the config.</p>
+  </div>
+</section>
+
+<!-- HOW -->
+<section id="how" class="alt">
+  <div class="wrap">
+    <div class="how">
+      <div>
+        <p class="kicker">How it works</p>
+        <h2 style="font-size:clamp(28px,4vw,40px);letter-spacing:-0.03em;font-weight:850;margin:0 0 28px;">Quietly correct, in its own space.</h2>
+        <ol class="steps">
+          <li><span class="n">1</span><div><h4>Stitch the oplog from the reflog</h4><p>On first use the operation log is built from git's reflog (the record of what you did) with the tool's own hops stripped. So even cold, the first undo reverses your last real op.</p></div></li>
+          <li><span class="n">2</span><div><h4>Reverse operations safely</h4><p>Each op records the branch it was on, so undo lands you back on that branch (recreating it if it was deleted) and moves only that branch's tip. A branch switch is reversed by switching back, never by a corrupting reset, and HEAD is never detached.</p></div></li>
+          <li><span class="n">3</span><div><h4>Append-only with prime anchors</h4><p>Act after undoing and a prime anchor is appended before your new op, so undo lands where you changed and the path you undid past is preserved.</p></div></li>
+          <li><span class="n">4</span><div><h4>Protect everything</h4><p>Each state gets a keep-ref so git's garbage collector can never reclaim an undone or abandoned commit.</p></div></li>
+        </ol>
+      </div>
+      <div class="term">
+        <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">inside .git/ - kept orthogonal</span></div>
+<pre><span class="c"># tracking, tucked away from your refs</span>
+.git/git-undo-redo/<span class="k">timeline</span>   <span class="dim">the oplog: sha + kind per op</span>
+.git/git-undo-redo/<span class="k">cursor</span>     <span class="dim">where HEAD sits</span>
+refs/git-undo-redo/<span class="k">keep</span>/…     <span class="dim">gc protection</span>
+
+<span class="c"># your space, left alone</span>
+refs/heads/main            <span class="at">✓ untouched</span>
+git reflog                 <span class="at">✓ clean backstop</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL FOOTNOTE -->
+<section style="padding:72px 0;">
+  <div class="wrap" style="text-align:center;">
+    <p class="kicker" style="text-align:center;">Get started</p>
+    <h2 style="font-size:clamp(26px,4vw,38px);letter-spacing:-0.03em;font-weight:850;margin:0 0 24px;">One line, then <span style="background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;">git undo</span>.</h2>
+    <div class="cmd" style="display:inline-flex;margin:0 auto;text-align:left;">
+      <span class="prompt">$</span>
+      <code id="cmd2">curl -fsSL https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/install.sh | bash</code>
+      <button class="copy" id="copy2" aria-label="Copy install command"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M10 1H4a2 2 0 0 0-2 2v7h2V3h6V1Zm2 3H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Zm0 10H7V6h5v8Z"/></svg><span id="copytxt2">Copy</span></button>
+    </div>
+    <p class="hint" style="text-align:center;">Prefer a clone? <code>git clone https://github.com/Drednaught608/git-undo-redo &amp;&amp; ./install.sh</code></p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot">
+    <div class="badges">
+      <span class="badge">macOS</span><span class="badge">Linux</span><span class="badge">Windows · Git-Bash</span><span class="badge">WSL</span>
+    </div>
+    <div>
+      <a href="https://github.com/Drednaught608/git-undo-redo">github.com/Drednaught608/git-undo-redo</a>
+      &nbsp;·&nbsp;
+      <a href="https://github.com/Drednaught608/git-undo-redo/blob/main/LICENSE">MIT-0 license</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  function wireCopy(btnId, codeId, txtId) {
+    var btn = document.getElementById(btnId);
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var text = document.getElementById(codeId).textContent;
+      navigator.clipboard.writeText(text).then(function () {
+        var t = document.getElementById(txtId);
+        var prev = t.textContent;
+        t.textContent = 'Copied!';
+        btn.classList.add('ok');
+        setTimeout(function () { t.textContent = prev; btn.classList.remove('ok'); }, 1600);
+      });
+    });
+  }
+  wireCopy('copy', 'cmd', 'copytxt');
+  wireCopy('copy2', 'cmd2', 'copytxt2');
+
+  /* Segmented theme control (Light │ Auto │ Dark), remembered in localStorage.
+     "auto" follows the OS via prefers-color-scheme. */
+  (function () {
+    var seg = document.getElementById('theme-seg');
+    if (!seg) return;
+    var btns = seg.querySelectorAll('button[data-mode]');
+    function read() {
+      try { return localStorage.getItem('gur-theme') || 'auto'; } catch (e) { return 'auto'; }
+    }
+    function apply(mode) {
+      if (mode === 'auto') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', mode);
+      btns.forEach(function (b) {
+        b.setAttribute('aria-pressed', b.dataset.mode === mode ? 'true' : 'false');
+      });
+    }
+    apply(read());
+    btns.forEach(function (b) {
+      b.addEventListener('click', function () {
+        try { localStorage.setItem('gur-theme', b.dataset.mode); } catch (e) {}
+        apply(b.dataset.mode);
+      });
+    });
+  })();
+</script>
+</body>
+</html>

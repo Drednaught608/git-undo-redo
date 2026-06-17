@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="git-undo-redo">
+  <defs>
+    <linearGradient id="gur" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fe315d"/>
+      <stop offset=".45" stop-color="#ff4d8d"/>
+      <stop offset="1" stop-color="#7b61ff"/>
+    </linearGradient>
+  </defs>
+  <!-- one continuous arch over the top, connecting both arrowheads (no gap) -->
+  <path d="M16 35 A16.5 16.5 0 1 1 48 35" stroke="url(#gur)" stroke-width="6" stroke-linecap="round"/>
+  <!-- undo arrowhead (lower-left end) -->
+  <path d="M19.1 47.6 L8.2 36.9 L23.8 33.1 Z" fill="url(#gur)"/>
+  <!-- redo arrowhead (lower-right end) -->
+  <path d="M44.9 47.6 L40.2 33.1 L55.8 36.9 Z" fill="url(#gur)"/>
+  <!-- commit dot -->
+  <circle cx="32" cy="35" r="5.5" fill="url(#gur)"/>
+</svg>
