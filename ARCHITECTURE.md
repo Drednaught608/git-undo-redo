@@ -71,12 +71,13 @@ undoredo.default` (global|edit|navigation; default global) changes it.
   position); an edit entry by one `git reset --hard` of the current branch. So
   `undo N` is a direct jump, not a walk. The tool's own HEAD moves are labeled - both
   the reset and the checkout via `GIT_REFLOG_ACTION` - so a re-seed strips them.
-- **Append-only with prime anchors.** Neither log is truncated. Acting after undoing
-  back to a point `B` appends a prime `B′` then your new entry `D`:
+- **Append-only with prime anchors** (a "resume point" to the user, shown as `↻ <kind>`).
+  Neither log is truncated. Acting after undoing back to a point `B` appends a prime `↻ B`
+  then your new entry `D`:
 
   ```
-  log: [A, B, C, B′, D]
-  undo from D → B′ (where you made D) → C (preserved) → B → A
+  log: [A, B, C, ↻ B, D]
+  undo from D → ↻ B (where you made D) → C (preserved) → B → A
   ```
 
   The prime records `D`'s true predecessor in the flat list, so undo lands correctly
@@ -158,7 +159,13 @@ that undo/redo inherently produce (and which we strip back out on seed).
 - **edit seed/sync** (`_ou_local_seed` / `_ou_local_sync`): the per-branch edit log is
   the HEAD reflog filtered to the edits made while THAT branch was active (active branch
   tracked through the `checkout: moving from A to B` messages, plus the branch's start
-  tip as the floor) - **not** the branch's own reflog, so it survives a delete+recreate.
+  tip as the `floor`, shown as `base` in the edit view: it is where the branch was created,
+  reachable so the first commit can be undone back to it) - **not** the branch's own reflog,
+  so it survives a delete+recreate. The floor is added ONLY when that start tip is NOT
+  already one of the branch's own edits: re-entering a branch we own (leave and come back)
+  sets the start tip to our CURRENT tip, which is in our edits - adding it as a floor below
+  them would inject a spurious, out-of-order `base` and break edit undo (oscillation). A
+  true branch point is a parent commit we never committed here, so it isn't in the log.
   Sync samples the branch tip and stitches new commits via `rev-list` (each stamped with
   its committer time; a ff-merge/reset tip-entry gets the branch's reflog event time
   instead, since it lands on an older commit whose own time would mis-order it). Cold-

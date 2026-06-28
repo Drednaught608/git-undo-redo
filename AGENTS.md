@@ -108,6 +108,16 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   protects nothing. (2) `_ou_nav_restore`/`_ou_local_restore` return their exit and
   every caller checks it: a failed restore must error and NOT advance the cursor, never
   print a success line. Don't remove the dedup or the exit checks.
+- **The global derive runs on every `oplog`/`opstatus`/`undo`/`redo`, so its hot path is
+  fork-disciplined: on Windows MSYS every `$(...)`, pipe, and external command is an
+  emulated `fork()` that dominates runtime (a process spawn costs far more than the work).
+  Prefer builtins - parameter expansion over `basename`/`dirname`/`tr`/`cut`, `read -r var
+  < file` (guarded by `[ -r file ]`, since a failed input redirect leaks past a trailing
+  `2>/dev/null`) over `$(cat file)`, `mapfile`/`${#arr[@]}` over `| wc -l`, `read -r x <
+  <(cmd)` over `cmd | head -1` - and the cached `_OU_SDIR`/`_OU_HEAD`/`_OU_BRANCH` (seeded
+  by `_ou_require_repo` in one rev-parse) over re-calling `_ou_state_dir`/`_ou_head`/
+  `_ou_branch`. Batch per-branch git (`for-each-ref` for tips) and precompute per-branch
+  paths once (the `LDIR` map) instead of per loop. Don't reintroduce subshells here.
 - License is MIT-0; keep the `SPDX-License-Identifier: MIT-0` headers.
 
 ## Files

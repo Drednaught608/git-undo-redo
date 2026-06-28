@@ -92,10 +92,10 @@ the history browser, status - is optional power, summarized here and explained u
 | `git redo` / `-e` / `-n` / `-g` | Re-apply your last operation across both axes (`-g`, default), an edit (`-e`), or a branch switch (`-n`) that you undid. |
 | `git take` | Copy the branch's **latest** edit (the top of the edit log) into your files **without moving** `HEAD` - the common flow is `git undo` to look back, then `git take` to pull your newest work in. Lands unstaged by default. Edit-based (reads the current branch's log); needs a clean tree and a branch. |
 | `git take N` | Reach the commit `N` entries above your current point (so `git take 1` is the closest one above you, `git take 2` further up). Applies that commit's full tree wholesale. Refuses, changing nothing, if there are fewer than `N` commits above you. |
-| `git undo -i` / `git redo -i` | Open the picker for the chosen scope (global by default, `-e` for edit, `-n` for navigation) and drop straight to a point you choose (press `t` to toggle prime anchors). Same screen as `git oplog -i`. |
-| `git oplog` | Show the composed **global log**, newest first, with `@` marking where you are. `-e`/`--edit` shows the current branch's **edit log**, `-n`/`--navigation` the **navigation log**. (`-c`/`--compact` hides prime anchors; `-f`/`--full` is the default.) |
+| `git undo -i` / `git redo -i` | Open the picker for the chosen scope (global by default, `-e` for edit, `-n` for navigation) and drop straight to a point you choose (press `t` to toggle resume points). Same screen as `git oplog -i`. |
+| `git oplog` | Show the composed **global log**, newest first, with `@` marking where you are. `-e`/`--edit` shows the current branch's **edit log**, `-n`/`--navigation` the **navigation log**. (`-c`/`--compact` hides resume points (↻); `-f`/`--full` is the default.) |
 | `git oplog --interactive` | Show the log (edit, navigation, or global via `-e`/`-n`/`-g`) and drop straight to a point you pick (`-i`; `-c`/`-f` set the initial view, `t` toggles it in-screen). A cursor move; for navigation it's a single atomic checkout. |
-| `git oplog --reset` | Drop the tracked logs (navigation + per-branch edit logs) so they rebuild cleanly from git's reflog on the next command (a rebuild, not a wipe - recent history stitches back; accumulated tracking older than the reflog, prime anchors, and any wedged state are dropped). Your commits and files are untouched. |
+| `git oplog --reset` | Drop the tracked logs (navigation + per-branch edit logs) so they rebuild cleanly from git's reflog on the next command (a rebuild, not a wipe - recent history stitches back; accumulated tracking older than the reflog, resume points, and any wedged state are dropped). Your commits and files are untouched. |
 | `git opstatus` | Show the current `HEAD` and how many undo / redo steps remain, globally across both axes (default), for the current branch's edits (`-e`/`--edit`), or the navigation log (`-n`/`--navigation`). |
 
 `git config undoredo.default` (`global`, the default, or `edit` / `navigation`) governs the scope of a bare `git undo` / `git redo` / `git oplog` / `git opstatus`. `git config undoredo.oplog` (`full`, the default, or `compact`) sets the default `git oplog` view. `git config undoredo.take` (`unstaged`, the default, or `staged`) sets where `git take` lands the changes. `git config undoredo.color` (`auto`, the default, or `always` / `never`) controls colored output: `auto` colors only when writing to a terminal (and honors `NO_COLOR`), so piped output stays plain. Short flags can be bundled - `git oplog -nc` is `git oplog -n -c`, and so on (a count stays separate: `git undo -e 3`, not `-e3`).
@@ -237,7 +237,7 @@ contributors.
   commit.
 - **Global is derived, never stored.** The global scope merges the two durable logs
   by their stored event times into one chronological throughline (dropping each axis's
-  internal scaffolding, keeping prime anchors), then walks it - dispatching each step
+  internal scaffolding, keeping resume points), then walks it - dispatching each step
   to an edit reset or a nav checkout. It's never written as a third log; only the
   global cursor (`.git/git-undo-redo/global/cursor`, a single integer) is kept. Reading
   the durable logs rather than the live reflog is exactly what lets it survive reflog
@@ -252,11 +252,12 @@ contributors.
   loses its edit history - `git branch -d` deletes the branch reflog, but the edits
   are still in HEAD's, attributable to that branch. (This is also how a `git undo`
   that recreates a branch can still step through its edits.)
-- **Append-only with prime anchors.** Neither log is ever truncated. Act after
-  undoing back to a point `B` and it records a prime anchor `B′` then your new entry,
-  so undo lands where you resumed and the path you undid past is still there to walk
-  back through. Nothing is ever lost. (A prime shows as that kind with a prime mark,
-  e.g. `commit′` in the edit log, `checkout′` in the navigation log.)
+- **Append-only with resume points.** Neither log is ever truncated. Act after
+  undoing back to a point `B` and it records a **resume point** at `B` then your new
+  entry, so undo lands where you carried on and the path you undid past is still there
+  to walk back through. Nothing is ever lost. (A resume point shows the underlying kind
+  marked with `↻`, e.g. `↻ commit` in the edit log, `↻ checkout` in the navigation log -
+  the log header explains it whenever one is present.)
 - **Atomic in each domain.** An edit is a single `reset` of one branch; a navigation
   is a single `checkout` (recreating the branch if you'd deleted it, never detaching
   unless you asked to). So `git undo N` is a direct jump to that point, not a walk
@@ -296,7 +297,7 @@ contributors.
 - **`git oplog --reset`** drops the tracked oplog and its gc protections so the next
   command rebuilds it cleanly from git's reflog. It's a *rebuild*, not a wipe: the
   reflog is exactly what the tool seeds from, so your recent history stitches back in
-  - what's dropped is accumulated tracking older than the reflog, prime anchors, and
+  - what's dropped is accumulated tracking older than the reflog, resume points, and
   any wedged state. Anything the reflog no longer reaches stays only in git's reflog
   until it expires. (Long flag only, by design, so it can't be triggered by accident.)
 - **No hooks, no daemon.** Each log catches up from the reflog when you run a command.

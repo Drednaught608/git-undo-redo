@@ -67,9 +67,11 @@ set -u
 # How many operations of pre-existing reflog history to stitch on first use.
 OU_SEED_LIMIT=${OU_SEED_LIMIT:-100}
 
-# Cached once per run by _ou_require_repo: the state dir and HEAD's sha. Caching is
-# per-process only (a fresh process each command), so config/state changes are
-# always picked up on the next invocation - nothing is persisted across runs.
+# Cached once per run by _ou_require_repo from a single rev-parse: the state dir, HEAD's
+# sha, and the current branch (in _OU_BRANCH; see _ou_branch). Caching is per-process only
+# (a fresh process each command), so config/state changes are always picked up on the next
+# invocation - nothing is persisted across runs. _OU_BRANCH is intentionally left unset
+# here so _ou_branch can lazily fill it if ever read before _ou_require_repo runs.
 _OU_SDIR=""
 _OU_HEAD=""
 
@@ -83,16 +85,22 @@ _ou_state_dir() {
 }
 
 _ou_require_repo() {
-    # One git call gives both the git-dir (line 1) and HEAD's sha (line 2), and
-    # caching both here avoids re-spawning `git rev-parse` for the git-dir (used
-    # throughout) and for HEAD (read by the sync paths) on every call. The combined
-    # call also fails on a brand-new repo whose HEAD is unborn (no commits yet), so
-    # on failure we re-check the git-dir alone to tell "not a repo" from "no commits
-    # yet" - the latter is a normal empty repo, not an error in the user's setup.
-    local out gd
-    if out=$(git rev-parse --git-dir HEAD 2>/dev/null); then
-        _OU_SDIR="${out%%$'\n'*}/git-undo-redo"   # before first newline = git-dir
-        _OU_HEAD="${out#*$'\n'}"                   # after first newline  = HEAD sha
+    # One git call gives the git-dir (line 1), HEAD's sha (line 2), and HEAD's symbolic
+    # name (line 3: refs/heads/<branch>, or "HEAD" when detached) - caching all three
+    # here avoids re-spawning `git rev-parse` for the git-dir (used throughout), for HEAD
+    # (read by the sync paths), and for the current branch (read several times per derive;
+    # see _ou_branch). The combined call also fails on a brand-new repo whose HEAD is
+    # unborn (no commits yet), so on failure we re-check the git-dir alone to tell "not a
+    # repo" from "no commits yet" - the latter is a normal empty repo, not an error.
+    local out gd; local -a parts
+    if out=$(git rev-parse --git-dir HEAD --symbolic-full-name HEAD 2>/dev/null); then
+        mapfile -t parts <<< "$out"
+        _OU_SDIR="${parts[0]}/git-undo-redo"
+        _OU_HEAD="${parts[1]}"
+        case "${parts[2]:-}" in
+            refs/heads/*) _OU_BRANCH="${parts[2]#refs/heads/}" ;;   # on a branch
+            *)            _OU_BRANCH="" ;;                          # detached
+        esac
         return 0
     fi
     if gd=$(git rev-parse --git-dir 2>/dev/null); then
@@ -116,7 +124,14 @@ _ou_require_clean() {
 _ou_head()    { printf '%s' "$_OU_HEAD"; }   # cached by _ou_require_repo (read before any HEAD move)
 _ou_short()   { git log --oneline -1 "${1:-HEAD}" 2>/dev/null; }
 _ou_headref() { git symbolic-ref -q HEAD 2>/dev/null || printf ''; }
-_ou_branch()  { git symbolic-ref -q --short HEAD 2>/dev/null || printf ''; }
+# Current branch ("" = detached), cached per process in `_OU_BRANCH`. It is read several
+# times per command (each `$(_ou_branch)` is a subshell, so the read alone can't fill a
+# parent-visible cache); instead `_ou_require_repo` seeds it for free from its own
+# rev-parse, and the only thing that changes it mid-command - one of OUR checkouts -
+# re-seeds it via `_ou_branch_dirty` right after the move. Manual moves are a different
+# process, so the cache can never go stale within a run.
+_ou_branch()       { [ -n "${_OU_BRANCH+x}" ] || _ou_branch_dirty; printf '%s' "${_OU_BRANCH:-}"; }
+_ou_branch_dirty() { _OU_BRANCH=$(git symbolic-ref -q --short HEAD 2>/dev/null || printf ''); }
 
 # Map a "checkout: moving from A to B" endpoint to a branch name, or "" when it
 # is a commit (a detached checkout, e.g. "...to a1b2c3d"). Used by the seed to
@@ -142,7 +157,7 @@ _ou_local_dir() {
 
 # Per-branch oplog directory for a named branch (used by the global merge, which
 # walks every branch's edit log - including ones we are not currently on).
-_ou_local_dir_for() { printf '%s/local/%s' "$(_ou_state_dir)" "$(_ou_enc "$1")"; }
+_ou_local_dir_for() { local e="$1"; e="${e//%/%25}"; e="${e////%2F}"; printf '%s/local/%s' "${_OU_SDIR:-$(_ou_state_dir)}" "$e"; }
 
 # User preferences, read once per run by _ou_load_config in a SINGLE git call for
 # all undoredo.* keys (per-process cache, so a `git config` change is picked up on
@@ -186,6 +201,7 @@ _ou_colors() {
     C_MUTE="$e[38;2;126;130;152m"      # grey   #7e8298
     C_ERR="$e[38;2;255;82;119m"        # red    #ff5277
     C_OK="$e[38;2;87;227;137m"         # green  #57e389
+    C_RESUME="$e[38;2;86;207;225m"     # cyan   #56cfe1 (resume points, distinct from branch purple)
 }
 
 # "1 commit" / "3 commits" -- naive pluralizer for human-facing messages.
@@ -264,7 +280,7 @@ LCUR=0
 
 # ANSI colors (populated by _ou_colors; empty = no color so output stays plain
 # when piped). Palette mirrors the landing page's terminal demo.
-C_RESET="" C_UNDO="" C_REDO="" C_AT="" C_KIND="" C_DIM="" C_MUTE="" C_ERR="" C_OK=""
+C_RESET="" C_UNDO="" C_REDO="" C_AT="" C_KIND="" C_DIM="" C_MUTE="" C_ERR="" C_OK="" C_RESUME=""
 
 # ===================================================================
 # Navigation oplog: a HEAD-position history (checkout/switch moves only),
@@ -275,11 +291,11 @@ C_RESET="" C_UNDO="" C_REDO="" C_AT="" C_KIND="" C_DIM="" C_MUTE="" C_ERR="" C_O
 # ===================================================================
 NV_SHA=(); NV_KIND=(); NV_REF=(); NV_TS=(); NCUR=0
 
-_ou_nav_dir()  { printf '%s/nav' "$(_ou_state_dir)"; }
+_ou_nav_dir()  { printf '%s/nav' "${_OU_SDIR:-$(_ou_state_dir)}"; }
 
 _ou_nav_load() {
     local d sha kind ref ts
-    d=$(_ou_nav_dir); [ -f "$d/timeline" ] && [ -f "$d/cursor" ] || return 1
+    d="$_OU_SDIR/nav"; [ -f "$d/timeline" ] && [ -f "$d/cursor" ] || return 1
     NV_SHA=(); NV_KIND=(); NV_REF=(); NV_TS=()
     # Lines are <sha>\t<kind>\t<ref>\t<ts>. ts (the reflog event time, for the
     # durable global merge) is the 4th field; legacy 3-field lines leave it empty.
@@ -287,12 +303,12 @@ _ou_nav_load() {
         [ -n "$sha" ] || continue
         NV_SHA+=("$sha"); NV_KIND+=("${kind:-checkout}"); NV_REF+=("${ref:-}"); NV_TS+=("${ts:-}")
     done < "$d/timeline"
-    NCUR=$(cat "$d/cursor" 2>/dev/null || printf 0)
+    NCUR=0; read -r NCUR < "$d/cursor" 2>/dev/null   # read from a file does not fork
     [ "${#NV_SHA[@]}" -gt 0 ]
 }
 
 _ou_nav_save() {
-    local d i; d=$(_ou_nav_dir); mkdir -p "$d"
+    local d i; d="$_OU_SDIR/nav"; [ -d "$d" ] || mkdir -p "$d"   # mkdir is a fork; skip when present
     : > "$d/timeline"
     for (( i=0; i<${#NV_SHA[@]}; i++ )); do
         printf '%s\t%s\t%s\t%s\n' "${NV_SHA[i]}" "${NV_KIND[i]}" "${NV_REF[i]}" "${NV_TS[i]:-}"
@@ -375,12 +391,12 @@ _ou_nav_seed() {
 # Total HEAD reflog entry count - our consumption watermark. (Identical switch
 # sequences are indistinguishable by content, so we track HOW FAR we've read, not
 # WHAT we read. Between two commands the reflog only grows, so a count is stable.)
-_ou_reflog_count() { git reflog --format='%H' 2>/dev/null | wc -l | tr -d ' '; }
+_ou_reflog_count() { local _a; mapfile -t _a < <(git reflog --format='%H' 2>/dev/null); printf '%s' "${#_a[@]}"; }
 
 # Event time (unix seconds) of the newest HEAD reflog entry - the durable ordering
 # key a navigation entry needs (a checkout's landing sha carries the wrong time: the
 # committed-at time of the commit you jumped to, not when you jumped). Empty if none.
-_ou_reflog_ts() { local g; g=$(git reflog --date=unix --format='%gd' 2>/dev/null | head -1); printf '%s' "${g//[!0-9]/}"; }
+_ou_reflog_ts() { local g=''; read -r g < <(git reflog --date=unix --format='%gd' 2>/dev/null); printf '%s' "${g//[!0-9]/}"; }
 
 # Reconcile the nav log with git's reflog before an op. Navigation is read straight
 # from the HEAD reflog (filtered to checkout moves), not sampled: edits can sample a
@@ -389,9 +405,9 @@ _ou_reflog_ts() { local g; g=$(git reflog --date=unix --format='%gd' 2>/dev/null
 # we last synced (the newest <delta> reflog entries) are appended.
 _ou_nav_sync() {
     _ou_nav_load || { _ou_nav_seed; return $?; }
-    local seenf="$(_ou_nav_dir)/seen" seen now delta
-    seen=$(cat "$seenf" 2>/dev/null || printf 0)
-    now=$(_ou_reflog_count)
+    local seenf="$_OU_SDIR/nav/seen" seen=0 now delta _rc
+    [ -r "$seenf" ] && read -r seen < "$seenf"   # guarded redirect; reading a file does not fork
+    mapfile -t _rc < <(git reflog --format='%H' 2>/dev/null); now=${#_rc[@]}   # inlined count (one fork)
     delta=$(( now - seen ))
     if [ "$delta" -gt 0 ]; then
         # Among the newest <delta> reflog entries, keep the user checkout moves (skip
@@ -435,7 +451,7 @@ _ou_nav_sync() {
     # match keeps the stored cursor, so an ordinary nav undo to a revisited branch is
     # left exactly where it landed.
     local chead cbr j
-    chead=$(_ou_head); cbr=$(_ou_branch)
+    chead="$_OU_HEAD"; cbr="${_OU_BRANCH:-}"   # cached; nav_sync runs before any HEAD move
     if [ "${NV_REF[$NCUR]:-}" != "$cbr" ] || { [ -z "$cbr" ] && [ "${NV_SHA[$NCUR]:-}" != "$chead" ]; }; then
         for (( j=${#NV_SHA[@]}-1; j>=0; j-- )); do
             [ "${NV_KIND[j]}" = prime ] && continue
@@ -449,6 +465,7 @@ _ou_nav_sync() {
 # Jump the nav cursor straight to index $1 (one checkout). $2 = action label.
 _ou_nav_goto() {
     _ou_nav_restore "${NV_SHA[$1]}" "${NV_REF[$1]}" "${2:-git-undo}" || return 1
+    _ou_branch_dirty   # the checkout may have changed the current branch
     NCUR="$1"; printf '%s\n' "$NCUR" > "$(_ou_nav_dir)/cursor"
 }
 
@@ -530,16 +547,18 @@ GL_SHA=(); GL_KIND=(); GL_REF=(); GCUR=0
 # ones whose log persists) plus the current branch - the set the global merge
 # unions across.
 _ou_global_branches() {
-    local sdir d b; sdir=$(_ou_state_dir) || return 0
+    # Hot path - everything here is pure builtins (no basename/_ou_dec/_ou_branch
+    # subshells): on Windows each $(...) is an emulated fork that dominates runtime.
+    local sdir="${_OU_SDIR:-}" d b; [ -n "$sdir" ] || sdir=$(_ou_state_dir) || return 0
     declare -A seen
     if [ -d "$sdir/local" ]; then
         for d in "$sdir/local"/*; do
             [ -d "$d" ] || continue
-            b=$(_ou_dec "$(basename "$d")")
+            b="${d##*/}"; b="${b//%2F//}"; b="${b//%25/%}"   # basename + _ou_dec, inlined
             [ -n "${seen[$b]:-}" ] || { seen["$b"]=1; printf '%s\n' "$b"; }
         done
     fi
-    b=$(_ou_branch); [ -n "$b" ] && [ -z "${seen[$b]:-}" ] && printf '%s\n' "$b"
+    b="${_OU_BRANCH:-}"; [ -n "$b" ] && [ -z "${seen[$b]:-}" ] && printf '%s\n' "$b"
 }
 
 _ou_global_derive() {
@@ -563,9 +582,21 @@ _ou_global_derive() {
     # glob vs nav refs, depending on which logs exist yet), so without sorting, same-second
     # cross-branch entries could reorder between derivations and invalidate the cursor.
     [ "${#gbs[@]}" -gt 1 ] && mapfile -t gbs < <(printf '%s\n' "${gbs[@]}" | sort)
+    # Precompute each branch's edit-log dir ONCE, fork-free (pure parameter expansion, no
+    # $(_ou_local_dir_for) per loop) - this path is rebuilt in three loops below, and on
+    # Windows every $(...) is a costly emulated fork. _OU_SDIR is set by _ou_require_repo.
+    declare -A LDIR; local _e
     for gb in "${gbs[@]}"; do
-        git show-ref --verify --quiet "refs/heads/$gb" \
-            && _ou_local_sync "$(_ou_local_dir_for "$gb")" "$gb" 2>/dev/null
+        _e="${gb//%/%25}"; _e="${_e////%2F}"; LDIR["$gb"]="$_OU_SDIR/local/$_e"
+    done
+    # Batch every branch's tip in ONE git call (process spawns dominate on Windows), then
+    # sync only branches that still exist, handing each its tip so the sync skips its own
+    # rev-parse. Replaces a show-ref + rev-parse per branch with a single for-each-ref.
+    declare -A TIPS; local _t _b
+    while read -r _t _b; do [ -n "$_b" ] && TIPS["$_b"]="$_t"; done \
+        < <(git for-each-ref --format='%(objectname) %(refname:short)' refs/heads/ 2>/dev/null)
+    for gb in "${gbs[@]}"; do
+        [ -n "${TIPS[$gb]:-}" ] && _ou_local_sync "${LDIR[$gb]}" "$gb" "${TIPS[$gb]}" 2>/dev/null
     done
 
     # 2. Build the chronological throughline by MERGING the oplogs (not the reflog).
@@ -585,11 +616,13 @@ _ou_global_derive() {
     local TAB=$'\t' i sha kind ref ts rows=()
     declare -A CT NAVCO
 
-    # 2a. Batch every branch edit log's committer times in a single git call.
+    # 2a. Committer time is ONLY a fallback for legacy entries with no stored ts, so
+    #     batch it for just those shas (none on a current log) - skipping the git call
+    #     entirely in the common case.
     local allsha=() src=0
     for gb in "${gbs[@]}"; do
-        _ou_local_load "$(_ou_local_dir_for "$gb")" || continue
-        for (( i=0; i<${#LT_SHA[@]}; i++ )); do allsha+=("${LT_SHA[i]}"); done
+        _ou_local_load "${LDIR[$gb]}" || continue
+        for (( i=0; i<${#LT_SHA[@]}; i++ )); do [ -n "${LT_TS[i]:-}" ] || allsha+=("${LT_SHA[i]}"); done
     done
     if [ "${#allsha[@]}" -gt 0 ]; then
         while read -r rsha ts; do CT["$rsha"]="$ts"; done \
@@ -623,7 +656,7 @@ _ou_global_derive() {
     #     true floor always has a parent - so the root check keeps the genesis as an edit
     #     row. (New logs need no root guard: a real genesis is never tagged `floor`.)
     for gb in "${gbs[@]}"; do
-        _ou_local_load "$(_ou_local_dir_for "$gb")" || continue
+        _ou_local_load "${LDIR[$gb]}" || continue
         src=$(( src + 1 ))
         local floor=-1 ets=()
         if [ "${#LT_SHA[@]}" -gt 0 ]; then
@@ -657,7 +690,11 @@ _ou_global_derive() {
     done < <(printf '%s\n' "${rows[@]}" | sort -t"$TAB" -k1,1n -k2,2n -k3,3n)
 
     [ "${#GL_SHA[@]}" -gt 0 ] || return 1
-    _ou_keep_all "${GL_SHA[@]}"
+    # Re-protect the throughline from gc. Every sha here was already kept when its entry
+    # was recorded (nav/edit sync each `_ou_keep`), so this is a backstop - and a read-only
+    # view (oplog/opstatus) creates no new objects, so it can skip the extra git call. A
+    # mutating walk (undo/redo) still re-keeps before moving HEAD.
+    [ "${1:-}" = readonly ] || _ou_keep_all "${GL_SHA[@]}"
     # Cursor: a position (branch, sha) can repeat in the throughline (a branch revisited
     # at the same commit), so content alone can't say where you are mid-undo. Trust the
     # stored index while it still matches HEAD (the pure-global flow). When it doesn't
@@ -666,13 +703,15 @@ _ou_global_derive() {
     # ...") is an edit landing, a bare checkout hop ("git-undo") is a navigation landing.
     # That keeps an edit-undo to a twice-visited commit on the commit point, not the
     # later switch-back. Fall back to the newest occurrence when there is no tool hop.
-    local hn hb stored; hn=$(_ou_head); hb=$(_ou_branch)
-    stored=$(cat "$(_ou_global_dir)/cursor" 2>/dev/null || printf -- -1)
+    local hn hb stored=-1; hn="$_OU_HEAD"; hb="${_OU_BRANCH:-}"   # cached; derive runs before any walk
+    # [ -r ] guards the redirect: `read < missing 2>/dev/null` still leaks the open error
+    # (the input redirect is applied before 2>). Reading from a file does not fork.
+    [ -r "$_OU_SDIR/global/cursor" ] && read -r stored < "$_OU_SDIR/global/cursor"
     if [ "$stored" -ge 0 ] && [ "$stored" -lt "${#GL_SHA[@]}" ] \
        && [ "${GL_SHA[$stored]}" = "$hn" ] && [ "${GL_REF[$stored]}" = "$hb" ]; then
         GCUR=$stored
     else
-        local want top; top=$(git reflog --format='%gs' 2>/dev/null | head -1)
+        local want top=''; read -r top < <(git reflog --format='%gs' 2>/dev/null)
         case "$top" in
             git-undo:*|git-redo:*|git-recover:*) want=edit ;;
             git-undo|git-redo|git-recover)       want=checkout ;;
@@ -712,11 +751,12 @@ _ou_global_restore() {
     fi
 }
 
-_ou_global_dir() { printf '%s/global' "$(_ou_state_dir)"; }
+_ou_global_dir() { printf '%s/global' "${_OU_SDIR:-$(_ou_state_dir)}"; }
 
 _ou_global_goto() {
     _ou_global_restore "${GL_SHA[$1]}" "${GL_REF[$1]}" "${2:-git-undo}" || return 1
-    GCUR="$1"; mkdir -p "$(_ou_global_dir)"; printf '%s\n' "$GCUR" > "$(_ou_global_dir)/cursor"
+    _ou_branch_dirty   # a global step may have switched branches
+    GCUR="$1"; local gd="$_OU_SDIR/global"; [ -d "$gd" ] || mkdir -p "$gd"; printf '%s\n' "$GCUR" > "$gd/cursor"
 }
 
 # Walk one entry at a time - each step reverses/reapplies one operation in order.
@@ -819,7 +859,7 @@ _ou_local_load() {
         [ -n "$sha" ] || continue
         LT_SHA+=("$sha"); LT_KIND+=("${kind:-other}"); LT_TS+=("${ts:-}")
     done < "$d/timeline"
-    LCUR=$(cat "$d/cursor")
+    LCUR=0; read -r LCUR < "$d/cursor" 2>/dev/null   # read from a file does not fork
     [ "${#LT_SHA[@]}" -gt 0 ] || return 1
 }
 
@@ -878,15 +918,20 @@ _ou_local_seed() {
         [ "${#shas[@]}" -ge "$OU_SEED_LIMIT" ] && break
     done < <(git reflog --date=unix --format='%H%x09%gd%x09%gs' 2>/dev/null)
 
-    # Floor: the tip the branch started at, so its oldest edit can be undone back to
-    # the branch point. Tagged `floor` (a SYNTHETIC entry - a commit made on the parent
-    # branch, not an edit made here) so the global merge can drop it precisely instead of
-    # guessing by sha, which would also drop the initial branch's real genesis commit when
-    # it shares a sha with a later checkout-back. (The initial branch has no checkout-in;
-    # its real "commit (initial)" entry is the floor, kept as a normal commit.) Displayed
-    # as a commit; only the global merge and the on-disk kind treat it specially.
-    if [ -n "$base" ] && { [ "${#shas[@]}" -eq 0 ] || [ "${shas[$(( ${#shas[@]} - 1 ))]}" != "$base" ]; }; then
-        shas+=("$base"); kinds+=("floor"); hops+=(0); tts+=("$basets")
+    # Floor: the tip the branch started at, so its oldest edit can be undone back to the
+    # branch point. Tagged `floor` (a SYNTHETIC entry - a commit on the PARENT branch, not
+    # an edit made here) so the global merge drops it precisely (and the edit view labels
+    # it `base`). Add it ONLY when base is NOT already one of this branch's own edits: base
+    # is the tip when we ENTERED the branch, and re-entering a branch we already own (leave
+    # and come back) sets base to OUR current tip, which is in our edits - adding it as a
+    # floor BELOW them injects a spurious, out-of-order `base` row and breaks edit undo
+    # (the initial branch would oscillate). A true branch point is a parent commit we never
+    # committed here, so it won't be in `shas`. (The initial branch has no real branch
+    # point; its genesis is a normal commit and stays the floor of its own log.)
+    if [ -n "$base" ]; then
+        local _bf=1 _bs
+        for _bs in ${shas[@]+"${shas[@]}"}; do [ "$_bs" = "$base" ] && { _bf=0; break; }; done
+        [ "$_bf" = 1 ] && { shas+=("$base"); kinds+=("floor"); hops+=(0); tts+=("$basets"); }
     fi
 
     [ "${#shas[@]}" -gt 0 ] || { echo "${C_ERR}❌ Error: $branch has no edit history to seed from.${C_RESET}" >&2; return 1; }
@@ -932,10 +977,11 @@ _ou_local_seed() {
 }
 
 # Reconcile a branch's edit log with its current tip: sample the tip, stitch in any
-# new commits (rev-list), prime if we acted after undoing.
+# new commits (rev-list), prime if we acted after undoing. $3 = a pre-fetched tip sha
+# (the global derive batches every branch's tip in one call); omit it and we look it up.
 _ou_local_sync() {
-    local d="$1" branch="$2" tip parked last sha kind j
-    tip=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null) || return 1
+    local d="$1" branch="$2" tip="${3:-}" parked last sha kind j
+    [ -n "$tip" ] || tip=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null) || return 1
     if ! _ou_local_load "$d"; then
         _ou_local_seed "$d" "$branch" || return 1
         return 0
@@ -1228,7 +1274,7 @@ Options:
   -n, --navigation  Undo the last branch switch / checkout (one atomic checkout).
   -i, --interactive Open the picker for the chosen scope (global by default, -e for
                     edit, -n for navigation) and drop straight to a point you choose
-                    ('t' toggles prime anchors). Like 'git oplog -i'.
+                    ('t' toggles resume points). Like 'git oplog -i'.
   -h                Show this help. (git owns '--help' - 'git undo --help' goes to
                     git's manual lookup, not here; -h is the help flag.)
 
@@ -1264,7 +1310,7 @@ Options:
   -n, --navigation  Redo the last undone branch switch / checkout (atomic).
   -i, --interactive Open the picker for the chosen scope (global by default, -e for
                     edit, -n for navigation) and drop straight to a point you choose
-                    ('t' toggles prime anchors). Like 'git oplog -i'.
+                    ('t' toggles resume points). Like 'git oplog -i'.
   -h                Show this help. (git owns '--help' - 'git redo --help' goes to
                     git's manual lookup, not here; -h is the help flag.)
 EOF
@@ -1280,9 +1326,9 @@ Usage: git oplog [-g|--global | -e|--edit | -n|--navigation] [-c|--compact | -f|
 
 Lists every tracked entry (oldest at the bottom), each tagged with its kind, with
 your current position marked '@'. The logs are append-only: when you act after
-undoing, a prime anchor of the state you resumed from is inserted first, so nothing
-you undid past is ever lost. A prime shows as that kind with a prime mark, e.g.
-'commit′' (edit log) / 'checkout′' (navigation log).
+undoing, a resume point of the state you carried on from is inserted first, so nothing
+you undid past is ever lost. A resume point shows the underlying kind marked with '↻',
+e.g. '↻ commit' (edit log) / '↻ checkout' (navigation log).
 
 Scope:
   -g, --global      Show both axes composed into one chronological log (every edit
@@ -1292,8 +1338,8 @@ Scope:
                     With none of these, follows `git config undoredo.default`.
 
 Views:
-  -f, --full        Show every entry, including prime anchors (default).
-  -c, --compact     Hide prime anchors for a cleaner list.
+  -f, --full        Show every entry, including resume points (↻) (default).
+  -c, --compact     Hide resume points for a cleaner list.
   -i, --interactive Show the log and drop straight to a point you pick (combine
                     with -e/-n and -c/-f; press 't' in the picker to toggle the
                     view). A cursor move, not a new operation. Also reachable as
@@ -1493,7 +1539,7 @@ git-undo-status() {
     [ -z "$mode" ] && mode=$(_ou_cfg_default)   # neither flag: follow undoredo.default
 
     if [ "$mode" = "global" ]; then
-        _ou_global_derive || { echo "${C_DIM}No history recorded yet.${C_RESET}"; return 0; }
+        _ou_global_derive readonly || { echo "${C_DIM}No history recorded yet.${C_RESET}"; return 0; }
         last=$(( ${#GL_SHA[@]} - 1 ))
         echo "${C_MUTE}HEAD is at:${C_RESET} $(_ou_short)"
         if [ "$GCUR" -eq 0 ] && [ "$last" -eq 0 ]; then
@@ -1529,15 +1575,15 @@ git-undo-status() {
     fi
 }
 
-# A prime anchor is shown as its underlying operation kind plus a prime mark, e.g.
-# "commit′" / "checkout′" - the op you resumed from, marked as the resume point (not
-# the bare word "prime"). The underlying kind is the real entry sharing the prime's
-# sha. $1 = index into TL_SHA/TL_KIND; echoes the bare kind (callers append the ′).
+# A prime anchor (the internal kind) is shown as its underlying operation kind plus the
+# resume mark, e.g. "↻ commit" / "↻ checkout" - the op you carried on from, marked as the
+# resume point (not the bare word "prime"). The underlying kind is the real entry sharing
+# the prime's sha. $1 = index into TL_SHA/TL_KIND; echoes the bare kind (callers add ↻).
 _ou_prime_kind() {
     local i="$1" sha="${TL_SHA[$1]}" j
     for (( j=0; j<${#TL_SHA[@]}; j++ )); do
         if [ "$j" -ne "$i" ] && [ "${TL_SHA[j]}" = "$sha" ] && [ "${TL_KIND[j]}" != prime ]; then
-            [ "${TL_KIND[j]}" = floor ] && printf 'commit' || printf '%s' "${TL_KIND[j]}"; return 0
+            [ "${TL_KIND[j]}" = floor ] && printf 'base' || printf '%s' "${TL_KIND[j]}"; return 0
         fi
     done
     printf 'commit'   # fallback: the real entry isn't in view (shouldn't happen)
@@ -1570,21 +1616,28 @@ _ou_oplog_print() {
             < <(git log --no-walk=unsorted --format='%H%x09%h %s' "${batch[@]}" 2>/dev/null)
     fi
 
-    echo "$title ${C_MUTE}(newest first; @ = current position)${C_RESET}:"
+    local _hp=0 _i   # legend only when a resume point is actually shown (compact hides all but the cursor's)
+    for (( _i=0; _i<${#TL_KIND[@]}; _i++ )); do
+        [ "${TL_KIND[_i]}" = prime ] || continue
+        { [ "$compact" -ne 1 ] || [ "$_i" -eq "$CUR" ]; } && { _hp=1; break; }
+    done
+    local legend="${C_AT}@${C_MUTE} = current position"
+    [ "$_hp" -eq 1 ] && legend="$legend, ${C_RESUME}↻${C_MUTE} = resume point"
+    echo "$title ${C_MUTE}(newest first; $legend)${C_RESET}:"
     local pad="         " kpad kcol mark subj uk   # pad = 9 spaces (kind column width)
     for (( i=${#TL_SHA[@]}-1; i>=0; i-- )); do
         kind="${TL_KIND[i]}"
-        [ "$kind" = floor ] && kind=commit          # a branch-point floor reads as a commit
+        [ "$kind" = floor ] && kind=base            # the branch-point floor: where this branch was created
         if [ "$compact" -eq 1 ] && [ "$kind" = "prime" ] && [ "$i" -ne "$CUR" ]; then
             continue
         fi
-        # @ marks the cursor (green); kind is pink at the cursor, purple for a
-        # prime anchor, amber otherwise - matching the landing page's demo.
+        # @ marks the cursor (green); kind is pink at the cursor, cyan for a resume
+        # point, amber otherwise - so a resume point reads apart from the purple branch.
         if [ "$i" -eq "$CUR" ]; then mark=" ${C_AT}@${C_RESET}"; kcol="$C_UNDO"
-        elif [ "$kind" = "prime" ];  then mark="  "; kcol="$C_REDO"
+        elif [ "$kind" = "prime" ];  then mark="  "; kcol="$C_RESUME"
         else                              mark="  "; kcol="$C_KIND"; fi
-        if [ "$kind" = "prime" ]; then             # show the resumed-from op, e.g. commit′
-            uk="$(_ou_prime_kind "$i")"; kpad="$uk′${pad:$(( ${#uk} + 1 ))}"
+        if [ "$kind" = "prime" ]; then             # the resumed-from op marked as a resume point, e.g. "↻ commit"
+            uk="$(_ou_prime_kind "$i")"; kpad="↻ $uk${pad:$(( ${#uk} + 2 ))}"
         else
             kpad="$kind${pad:${#kind}}"            # left-justify to 9 (no color in the width)
         fi
@@ -1652,7 +1705,7 @@ _ou_oplog_interactive() {
 _ou_show() {
     local mode="$1" compact="$2" interactive="$3" branch d
     if [ "$mode" = "global" ]; then
-        _ou_global_derive || { echo "${C_DIM}No history recorded yet.${C_RESET}"; return 0; }
+        _ou_global_derive readonly || { echo "${C_DIM}No history recorded yet.${C_RESET}"; return 0; }
         TL_SHA=("${GL_SHA[@]}"); TL_KIND=("${GL_KIND[@]}"); TL_REF=("${GL_REF[@]}"); CUR=$GCUR
         if [ "$interactive" -eq 1 ]; then
             _ou_oplog_interactive "$compact" global "Global operation log"
