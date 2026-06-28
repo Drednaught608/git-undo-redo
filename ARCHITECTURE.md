@@ -7,87 +7,112 @@ work builds on them instead of re-deriving (or accidentally reverting) them.
 
 ## What it is
 
-Operation-level undo/redo for git. `git undo` reverses your last *HEAD-moving
-operation* (commit, merge, rebase, reset, branch-switch checkout), and `git
-redo` re-applies it. It's modeled on Jujutsu's operation log: a private,
-append-only **oplog** kept in an orthogonal space inside `.git`, independent of
-git's reflog.
+Undo/redo for git along its two kinds of movable pointer - a branch tip and `HEAD`.
+`git undo` steps back your last *edit* on the current branch (commit, reset, merge,
+rebase, amend); `git undo -n` steps back your last *navigation* (branch switch /
+checkout); `git undo -g` steps back your single most recent operation across *both*,
+in chronological order. `git redo` re-applies. It's modeled on Jujutsu's operation
+log: private, append-only logs in an orthogonal space inside `.git`.
 
-There are two undo axes (separation of concerns): **global** (`-g`, the default)
-walks the shared operation log of everything HEAD did; **local** (`-l`) walks the
-current branch's own edits via a per-branch oplog, moving only that branch. The
-default for a bare `git undo`/`git redo` is `git config undoredo.default`
-(global|local).
+The two axes are orthogonal and each **atomic in its own domain** - an edit is one
+`reset` of one branch, a navigation is one `checkout` - so neither has to walk through
+the other. They are **durable projections of one source**: git's HEAD reflog, filtered
+two ways, then persisted to disk with a timestamp per entry so they outlive the reflog.
+The **global** view (`-g`/`--global`) is a *third, derived* view: it merges the two
+durable logs by those timestamps into one chronological throughline and walks it,
+dispatching each step to its own axis - composed live at query time, never a third
+stored log. **Global is the default scope** for a bare command; `git config
+undoredo.default` (global|edit|navigation; default global) changes it.
 
 ## The model
 
-- **Oplog = a flat, append-only list of operations.** Each entry is
-  `<sha>\t<kind>\t<branch>` (kind ∈ commit/merge/rebase/reset/checkout/cherry-pick/
-  revert/am/pull/clone/prime/seed/other; branch = the ref HEAD was on at that
-  state, empty if unknown/detached). A cursor marks where HEAD currently sits.
-  Undo/redo are pure cursor moves; the entry's `kind` and `branch` decide how HEAD
-  is restored.
-- **Seeded once from the reflog, then self-owned.** On first use the oplog is
-  stitched from git's reflog (the record of operations), with the tool's own
-  labeled hops stripped and consecutive dupes collapsed. The branch per historical
-  entry is recovered by reading the reflog's `checkout: moving from A to B`
-  messages while walking newest→oldest. After that the reflog is **never read for
-  navigation** - new operations are appended incrementally (sync records the live
-  branch).
-- **Restore is branch-aware and never detaches.** Each state carries the branch it
-  was on, so restore switches HEAD to *that* branch (if needed) and resets it to the
-  state's recorded sha. *Every* entry - branch-switch checkouts included - restores
-  to its own sha, so the cursor always matches HEAD and a later sync sees no phantom
-  change. If the branch was **deleted**, it is recreated at the recorded commit. A branch
-  HEAD is never detached. (Entries with no recorded branch - legacy/cold/detached -
-  use a heuristic that still never detaches.) The tool's own HEAD moves are
-  labeled - reset via `GIT_REFLOG_ACTION`, branch switch via `symbolic-ref -m` - so
-  the seed strips them and never re-ingests them.
-- **Append-only with prime anchors.** The oplog is never truncated. When you act
-  after undoing back to a point `B`, a prime marker `B′` (a logical copy of `B`'s
-  state) is appended, then your new op `D`:
+- **Two durable logs, both projections of the HEAD reflog.** Every move HEAD makes is
+  in its reflog, in order. We filter it two ways:
+  - the **navigation log** keeps the `checkout: moving ...` entries (position changes);
+  - each branch's **edit log** keeps the edits (commit/reset/merge/rebase/amend) made
+    while that branch was active, attributed by tracking the active branch through the
+    `checkout: moving from A to B` messages while walking newest→oldest.
+
+  Each log is a flat, append-only list with a cursor; nav entries are
+  `<sha>\t<kind>\t<ref>\t<ts>` (ref = branch name, empty = detached), edit entries
+  `<sha>\t<kind>\t<ts>`. The `ts` is the **reflog event time** captured when the entry
+  was recorded - the durable ordering key the global merge sorts by, so the logs (and
+  the global view) keep working after git expires the reflog. (A nav entry needs a
+  stored `ts` because its landing sha carries the wrong time; an edit entry's `ts` is
+  effectively the commit's committer time, which legacy logs without the column fall
+  back to.) Undo/redo are cursor moves; the entry decides how HEAD is restored.
+- **A derived global view, never a third stored log.** `git undo -g` composes the two
+  durable logs into one chronological throughline by **merging them on the stored
+  `ts`** (dropping each axis's own scaffolding - the nav origin entry, the per-branch
+  edit floors - and keeping prime anchors), then **walks** it, dispatching each step to
+  an edit reset or a nav checkout. Because it reads the durable logs, not the reflog, it
+  survives reflog expiry. The only stored global state is a cursor index
+  (`global/cursor`); the throughline itself is rebuilt on every command, so `git oplog
+  -g` and `git opstatus -g` always agree. Rows sort by `(ts, src, seq)` - ts the durable
+  event time, then the source log, then the entry's index WITHIN that log - so for
+  same-second entries each log's own order is preserved verbatim (the reflog is not
+  consulted at all). `undo -g N` WALKS (each step may belong to a different axis) - the
+  one place `undo N` is not a single atomic jump.
+- **Each cursor self-heals to where HEAD actually is.** A cross-axis op (a global walk)
+  or a manual `git checkout`/`reset` moves HEAD without going through a per-axis command,
+  so a stored cursor can fall stale. On its next sync the nav log re-anchors its cursor
+  to the branch/position HEAD is now on, and an edit log re-anchors to its current tip
+  (and, when a new commit forked off a state a global walk had moved to, to that merge-
+  base fork point). This is what keeps the three views orthogonal and correct after you
+  mix them: global-undo into another branch, manually check out back, and that branch's
+  edit redos are still exactly where you left them - and the same holds for navigation.
+- **Durable against branch deletion.** The edit log is read from HEAD's reflog, NOT a
+  branch's own reflog (which `git branch -d` deletes and a recreate never restores).
+  So a deleted/recreated branch keeps its edit history, and a global walk that
+  recreates a branch can still step through its edits. This is *why* both logs read
+  from the durable HEAD reflog rather than the per-branch one.
+- **Atomic restore per domain.** A nav entry is restored by one `git checkout` to its
+  position (recreating a deleted branch; detaching only for a recorded detached
+  position); an edit entry by one `git reset --hard` of the current branch. So
+  `undo N` is a direct jump, not a walk. The tool's own HEAD moves are labeled - both
+  the reset and the checkout via `GIT_REFLOG_ACTION` - so a re-seed strips them.
+- **Append-only with prime anchors.** Neither log is truncated. Acting after undoing
+  back to a point `B` appends a prime `B′` then your new entry `D`:
 
   ```
-  oplog: [A, B, C, B′, D]
+  log: [A, B, C, B′, D]
   undo from D → B′ (where you made D) → C (preserved) → B → A
   ```
 
-  The prime records `D`'s true predecessor at the right place in the flat list,
-  so undo lands correctly *and* nothing you undid past is lost.
-- **GC-proof & reflog-independent.** Every state ever seen gets a keep-ref
-  (`refs/git-undo-redo/keep/<sha>`), so git's garbage collector can never reclaim it
-  - undo/redo work even after the reflog fully expires. (Verified: works with the
-  reflog nuked and `gc --prune=now`.)
-- **Per-branch "local" oplogs.** Alongside the global oplog, each branch has its
-  own append-only edit log (same `<sha>\t<kind>` + cursor + prime model), seeded
-  from that branch's reflog (which *is* its edit history) with our hops stripped.
-  `git undo -l` walks it and resets only the current branch - so you can switch to
-  any branch and undo its last edit without being pulled elsewhere. The global and
-  local logs are independent; each absorbs the other's effects via its own sync
-  (a local move is just another HEAD move the global sync later records, and vice
-  versa). The cold seed reconstructs prime anchors it can't see directly - but a
-  prime can *only* be born from one of our own hops (an undo-then-reapply done
-  before the log existed), and those carry a `git-undo:`/`git-redo:` reflog label
-  that the seed strips. So reconstruction is driven by those labels: the edit
-  recorded right after a stripped hop, if it attached to an earlier recorded state
-  rather than its predecessor, gets that parent anchored before it. Unmarked
-  history (ordinary commits, merges, fast-forwards, manual `git reset`) never
-  yields a reconstructed prime. **Both** seeds do this - the global seed from
-  HEAD's reflog, the local seed from the branch's - because either undo scope
-  labels HEAD's reflog, so a local-first undo must still reconstruct correctly
-  when the global log is later cold-seeded (and vice versa).
-- **Unbounded retention.** The oplog accumulates forever (rebuilt only by
-  `git oplog --reset`). This is safe - see Performance.
+  The prime records `D`'s true predecessor in the flat list, so undo lands correctly
+  *and* nothing you undid past is lost. The cold seed reconstructs primes it can't see
+  directly, but *only* from our own labeled hops (an undo-then-reapply): the entry
+  recorded right after a stripped `git-undo:`/`git-redo:` hop, if it attached to an
+  earlier recorded state rather than its predecessor, gets that anchored before it.
+  Unmarked history (ordinary commits/merges/fast-forwards/manual reset) never yields a
+  reconstructed prime.
+- **GC-proof.** Every state seen gets a keep-ref (`refs/git-undo-redo/keep/<sha>`), so
+  gc can never reclaim an undone or abandoned commit - undo/redo work even after the
+  reflog fully expires. (Verified with the reflog nuked and `gc --prune=now`.)
+- **Catch-up, not hooks.** No daemon. The navigation log re-reads new checkouts from
+  the reflog each command - a count watermark (`nav/seen`) tracks how far it has
+  consumed, so even a net-zero switch-away-and-back is caught (switches have no
+  rev-list path; the reflog is their only record). An edit log samples its branch tip
+  and stitches in new commits via `rev-list`.
+- **Boundaries.** Off-branch tip-moves (`git branch -f`, a fetch) never move HEAD, so
+  they're outside the model at cold seed - the live tip-sampling catches them going
+  forward. A commit on a detached HEAD belongs to no branch's edit log (the
+  detached-commit seam). Both stay safe in git's reflog. These are the *only* gaps,
+  and they fall out cleanly from "everything derives from the HEAD reflog."
+- **Unbounded retention.** Logs accumulate (rebuilt only by `git oplog --reset`). Safe
+  - see Performance.
 
 ## Configuration
 
-Three `git config` keys (read at runtime; per-invocation flags always override):
+Four `git config` keys (read at runtime; per-invocation flags always override):
 
-- `undoredo.default` = `global` | `local` (default `global`) - the scope of a bare
-  `git undo` / `git redo` / `git oplog` / `git opstatus` (each also takes
-  `-g`/`--global` and `-l`/`--local`).
+- `undoredo.default` = `global` | `edit` | `navigation` (default `global`) - the scope of
+  a bare `git undo` / `git redo` / `git oplog` / `git opstatus` (each also takes
+  `-g`/`--global`, `-e`/`--edit`, and `-n`/`--navigation`).
 - `undoredo.oplog` = `full` | `compact` (default `full`) - the default `git oplog`
   view (`-c`/`-f` override).
+- `undoredo.take` = `unstaged` | `staged` (default `unstaged`) - whether `git take`
+  leaves its changes in the working tree (default) or staged (`-u`/`-s` override).
 - `undoredo.color` = `auto` | `always` | `never` (default `auto`) - colored output.
   `auto` colors only when stdout is a TTY and `NO_COLOR` is unset.
 
@@ -103,9 +128,9 @@ so alignment is unaffected. Help screens (`-h`) are intentionally left plain.
 ## On-disk layout
 
 ```
-.git/git-undo-redo/timeline          the global oplog, "<sha>\t<kind>\t<branch>", oldest first
-.git/git-undo-redo/cursor            0-based index of the current global position
-.git/git-undo-redo/local/<branch>/   a per-branch oplog (timeline "<sha>\t<kind>" + cursor)
+.git/git-undo-redo/nav/              the navigation log (timeline "<sha>\t<kind>\t<ref>\t<ts>", cursor, seen)
+.git/git-undo-redo/local/<branch>/   a per-branch edit log (timeline "<sha>\t<kind>\t<ts>" + cursor)
+.git/git-undo-redo/global/cursor     where you are in the (derived) global view - a single int
 refs/git-undo-redo/keep/<sha>        one ref per state (GC protection); packed by git gc
 ```
 
@@ -117,63 +142,78 @@ that undo/redo inherently produce (and which we strip back out on seed).
 
 ## Operation flow
 
-- **seed** (`_ou_seed`): stitch the oplog from `git reflog` (filtered), recovering
-  each entry's branch from `checkout:` messages, cap at `OU_SEED_LIMIT` (cold-start
-  bound only), keep-ref all states in one batched `update-ref --stdin`.
-- **sync** (`_ou_sync`): before every command, reconcile HEAD vs the parked
-  cursor. The reflog top's kind decides how: a forward move that's actual *commits*
-  → stitch each (`rev-list --reverse --first-parent`) as its own op; a forward move
-  that's a single non-commit op (a branch switch / ff-merge / rebase to a descendant)
-  → one op of that kind, not mislabeled `commit`; a divergent move → one op. If the
-  cursor was below the top, insert a prime first.
-- **undo / redo** (`_ou_goto` / `_ou_walk`): each step restores one state on its
-  recorded branch (switch to that branch if needed, reset it to the entry's sha -
-  uniform for every kind, checkout included; recreate the branch if deleted; never
-  detach). After a bounds check (refuse and change nothing if N exceeds the available
-  count, reporting how many are available), `git undo N` / `git redo N` and the `-i`
-  picker **walk** the cursor one entry at a time via `_ou_walk` - so global `undo 3`
-  is exactly three `git undo`s, faithfully reapplying each intermediate operation
-  (e.g. recreating a branch you undid past). The global log is an *operation* log, so
-  walking is the only way "what you see is what you get." Bare `undo`/`redo` is N=1.
-- **`--staged` (`-s`) is a thin post-step, not a navigation change.** Undo/redo navigate
-  exactly as normal, then `_ou_stage_apply` runs `git restore --source=<above> --staged
-  --worktree :/` to leave the **one commit directly above the landing** staged (index +
-  worktree), without moving HEAD - so the cursor still equals HEAD, you just have a dirty
-  tree (the "committed too early, let me edit and re-commit" flow). Always one commit,
-  never a chain (even for `undo --staged 3`).
-  - **One rule, every path: the staged commit is the `git take` rule.** `--staged` is
-    *defined* as "navigate (global or local, as the command says), then stage the commit
-    directly above the landing in **that branch's LOCAL edit log**" - identical to bare
-    `git take`. So `git undo --staged`, `git undo -l --staged`, the `git redo` forms, and
-    `git take` all share one staging semantic; only the navigation differs. There is no
-    `kind == commit` test anymore (a branch reflog holds only that branch's own tip-moves,
-    never a checkout, so *any* entry above is a takeable commit) - the only check is
-    "is there an entry above there." Global `--staged` finds the landing's neighbor via
-    `_ou_above_commit <landing-branch> <landing-sha>` (loading/seeding that branch's log),
-    which is why undoing a *checkout* still stages when the branch you land on has a commit
-    above. Local `--staged` reads the same position from its already-synced `LT_*`. Both
-    pre-check before navigating, so a "no commit above" case fails atomically and changes
-    nothing. (Retired `_ou_stage_check`: its kind gate was the lone inconsistency.)
-- **`git take [N]`** (`_ou_take` / public `git-take`): the fifth command, and the only
-  one that is *purely* a stage with **no navigation**. It syncs the current branch's
-  local log, then `_ou_stage_apply`s the commit `N` entries above the cursor (default 1)
-  onto the worktree - HEAD and the cursor never move. It's the after-the-fact `--staged`
-  (run it when you undid and forgot `-s`) and, uniquely, `N` can reach several commits
-  up in one shot (undo/redo `--staged` only ever take the one directly above). Always
-  edit-based; refuses on a detached HEAD, a dirty tree, or when `N` exceeds what's above.
-- **local undo / redo** (`_ou_undo_local` / `_ou_redo_local`): the `-l` path -
-  sync the current branch's own oplog (`_ou_local_seed` / `_ou_local_sync`) and
-  **jump** its cursor straight to the target index (`_ou_local_goto`, one reset),
-  resetting only that branch (`_ou_local_restore`). A per-branch log has no checkout
-  entries, so a jump is identical to walking - and the redo counter still shows the
-  real N. Refuses when HEAD is detached (no branch to scope to).
-- **oplog** (`_ou_oplog_print`): render a log with `@` at the cursor; `-g`/`-l`
-  pick the global or current-branch log (default `undoredo.default`), `-c` hides
-  primes, `-i` is an interactive picker (cursor move, no new op; local picks reset
-  the branch and save the local cursor, global picks save the global oplog).
-- **reset** (`_ou_reset`, `git oplog --reset`): delete the global timeline/cursor,
-  all per-branch logs, and keep-refs. Next command re-seeds from the live reflog -
-  i.e. it rebuilds, it doesn't permanently wipe (re-deriving is the model).
+- **navigation seed/sync** (`_ou_nav_seed` / `_ou_nav_sync`): the nav log is the HEAD
+  reflog filtered to `checkout: moving ...` moves, with our labeled hops stripped and
+  consecutive repeats collapsed; the oldest checkout's "from" is the origin position.
+  Sync reads the new checkouts since a count watermark (`nav/seen` = total reflog
+  entries last consumed) and appends them (each stamped with its reflog event time),
+  priming if mid-undo. Reading the reflog (not the net position) is what catches a
+  net-zero switch-away-and-back; the count watermark is what disambiguates an identical
+  repeated switch sequence. Sync then **re-anchors the cursor** to the branch/position
+  HEAD is actually on, so a prior global walk's checkout (which it skips as a labeled
+  hop) doesn't leave the cursor stale.
+- **navigation undo / redo** (`_ou_undo_nav` / `_ou_redo_nav` → `_ou_nav_goto`): one
+  atomic `git checkout` to the target position - a branch by name, or the sha detached
+  (recreating the branch if you'd deleted it). `undo N` is a single jump. Bounds-checked.
+- **edit seed/sync** (`_ou_local_seed` / `_ou_local_sync`): the per-branch edit log is
+  the HEAD reflog filtered to the edits made while THAT branch was active (active branch
+  tracked through the `checkout: moving from A to B` messages, plus the branch's start
+  tip as the floor) - **not** the branch's own reflog, so it survives a delete+recreate.
+  Sync samples the branch tip and stitches new commits via `rev-list` (each stamped with
+  its committer time; a ff-merge/reset tip-entry gets the branch's reflog event time
+  instead, since it lands on an older commit whose own time would mis-order it). Cold-
+  seed prime reconstruction runs off the same labeled hops as the nav seed. Sync also
+  re-anchors, but ONLY for moves WE made: if the branch reflog top is one of our labeled
+  hops (or is gone, leaving the durable global walk) and the tip is a state already in the
+  log, it repositions the cursor instead of re-recording. A move WE did not make - a
+  user's `git reset --hard <ancestor>`, which leaves a real `reset:` reflog entry - is
+  instead RECORDED as a new operation, so `git undo` reverses it (recovering the discarded
+  commits; this is the headline `reset --hard` rescue, and it must work for a primed repo,
+  not just a cold seed). Before recording, sync corrects a stale cursor to the branch's
+  actual pre-move tip (the 2nd branch-reflog entry), so a reset after a global walk records
+  from where the branch really was, not a spot the walk left the cursor (which would inject
+  a spurious prime and undo one step short). It also re-anchors to the merge-base fork point
+  when a new commit forked off a state a global walk moved to, so that commit primes right.
+- **edit undo / redo** (`_ou_undo_local` / `_ou_redo_local` → `_ou_local_goto`): jump
+  the cursor straight to the target and one `git reset --hard` of the current branch
+  (`_ou_local_restore`). Refuses on a detached HEAD (no branch to scope to).
+- **global derive / walk** (`_ou_global_derive` → `_ou_global_walk` / `_ou_undo_global` /
+  `_ou_redo_global`): first refresh both axes from the reflog while it lives (sync nav +
+  seed/sync every branch's edit log - branch set = local-dir branches ∪ current ∪ every
+  branch the nav log switched to), then **merge** their entries by stored `ts` into one
+  oldest→first throughline (dropping the nav origin and the per-branch edit floors - the
+  synthetic branch-point entries, tagged `floor`, already carried by the nav checkout-in -
+  while keeping primes). Dropping by the `floor` tag (not by sha) is what keeps the initial
+  branch's real genesis commit in the log even when a later checkout BACK to that branch
+  shares its sha (a legacy log without the tag falls back to a sha match guarded by a root
+  check, since a real floor always has a parent). Each entry already carries its branch
+  (nav `ref`, edit dir), so restore is
+  uniform: switch to that branch (recreate if deleted) and reset to the sha, or detach.
+  The cursor is trusted while it matches HEAD and re-anchored otherwise, preferring the
+  occurrence whose kind matches how you arrived (a reset hop = an edit landing, a bare
+  checkout hop = a nav landing). `undo -g N` walks one step at a time.
+- **`git take` / `git take N`** (`_ou_take` / public `git-take`): copy a commit's full
+  tree onto the working tree with **no** navigation (HEAD and cursor never move). Bare
+  `git take` grabs the branch's **latest** edit (the top of its edit log) - the "I undid
+  to look around, now give me my newest work back" case - but **skips a trailing reset**:
+  a reset moves backward, so a bare take landing on one would grab an older state (no
+  intentional use), so it falls to the latest real edit (a commit ABOVE a reset is still
+  taken; only a reset AT the top is skipped). `git take N` instead reaches the commit `N`
+  entries above the current point (so `take 1` is the closest one above you), counting
+  every entry including resets.
+  `_ou_take_apply` runs `git restore --source=<commit> [--staged] --worktree :/`: by
+  default worktree-only, so the changes land **unstaged** (the new default; the old
+  always-staged behavior was found more annoying); `-s`/`--staged` (or
+  `undoredo.take=staged`) also writes the index. Clean tree + a non-detached HEAD
+  required. The removed `git undo --staged` flow is now just `git undo` then `git take`.
+- **oplog / picker** (`_ou_show` → `_ou_oplog_print` / `_ou_oplog_interactive`): render
+  the chosen log - `-e` edit / `-n` navigation (default `undoredo.default`). The printer
+  reads a generic `TL_*` buffer that `_ou_show` copies the chosen log into. `-c` hides
+  primes; `-i` is a picker (cursor move, no new op): an edit pick resets the branch and
+  saves the edit cursor, a nav pick is one atomic checkout.
+- **reset** (`_ou_reset`, `git oplog --reset`): delete the nav + per-branch logs and
+  keep-refs; the next command re-seeds from the live reflog. A rebuild, not a wipe
+  (re-deriving from the reflog *is* the model).
 - Both seeds anchor their cursor on the *actual* HEAD/branch tip (not just the
   newest entry), so a prior tool hop that moved it back doesn't misplace it.
 
@@ -194,70 +234,89 @@ that undo/redo inherently produce (and which we strip back out on seed).
   itself; an ordinary commit/merge/fast-forward abandons nothing). Inferring primes
   from topology alone ("first parent isn't the predecessor") invents phantom primes
   before every merge (a `Merge pull request` whose first parent is the base) and
-  even mishandles `--amend`. So both seeds (global from HEAD's reflog, local from
-  the branch's) flag the kept entry immediately after each stripped hop and
-  reconstruct only for those. The global seed needs this as much as the local one:
-  a tool undo lands a label in HEAD's reflog even when it was a local-first undo,
-  so a later global cold-seed must reconstruct the prime or it strands a global
-  undo on the abandoned commit. Don't revert to a topological guess, and keep the
-  two seeds symmetric.
-- **Global vs local as two independent oplogs, not one stitched view.** `-l`
-  (per-branch edit undo) is a *separate* append-only log per branch, reusing the
-  global cursor + prime machinery but keyed to the branch tip. We rejected
-  deriving `-l` from the global oplog: undo derives cleanly, but *redo* needs to
-  follow the live lineage past abandoned commits, which is fragile from a filtered
-  view. A dedicated per-branch log makes redo correct and free. We also rejected
-  *stitching* the two logs into one timeline (timestamp merges are coarser than
-  the per-stream order, and it multiplies cursor state) - keeping them independent,
-  each self-syncing, is simpler and more reliable.
-- **Local live sync drops cross-scope navigation; global keeps every op.** A branch
-  reflog records only that branch's own tip-moves - branch switches are HEAD-only -
-  so a `git-undo:`/`git-redo:` label on top of it unambiguously marks a cross-scope
-  tool hop (e.g. a global undo that moved this branch), not a new edit. `_ou_local_sync`
-  treats such a hop as navigation: if it landed on a state already in the per-branch
-  log, it just repositions the cursor (like the seed) instead of recording a
-  redundant `undo`/`redo`-kind op - so the live local log matches a cold reseed and
-  interleaving `-g`/`-l` on one branch doesn't bloat it. The global log is left as-is
-  on purpose: it's the comprehensive HEAD operation log and *should* record every op,
-  so we don't strip there. (Asymmetry by design - a per-branch edit log wants only
-  edits; the global log wants everything.)
-- **Record the branch per op; restore onto it; recreate it if deleted; never
-  detach.** Each entry stores the branch HEAD was on (recovered from `checkout:`
-  reflog messages at seed, captured live afterward). Restore uses it: switch to that
-  branch (if needed) and reset it to the entry's sha - uniformly, checkout edges
-  included, so the cursor and HEAD never disagree. A deleted branch is recreated at
-  the recorded commit. This keeps the
-  type-aware logic but feeds it real data instead of guessing the branch with
-  `for-each-ref` - which is what detached HEAD (no branch at the state, common
-  after merges) and reset the wrong branch (a switch swallowed into a gap). An
-  earlier worry that a "stored ref" couldn't be reconstructed from a cold reflog is
-  handled by parsing the `checkout:` messages; entries we still can't resolve keep
-  an empty branch and use a heuristic that never detaches. The tool's own HEAD
-  moves are labeled (reset via `GIT_REFLOG_ACTION`, switch via `symbolic-ref -m`)
-  so the seed strips them.
-- **Every restored state resets to its own sha - checkout edges included.** An
-  earlier design kept the branch's *live* tip when restoring a checkout edge (a
-  switch is "just" HEAD navigation). But then parking the cursor on a checkout entry
-  left HEAD at the tip while the entry's recorded sha differed: the cursor and HEAD
-  desynced, the next `sync` logged a phantom op, and stepping `git undo` across a
-  checkout stranded HEAD on the wrong commit (cursor said one place, HEAD was at
-  another). Resetting *every* entry to its own sha makes each oplog point a true
-  self-contained snapshot, so undo, redo, and the `-i` jump all agree and the cursor
-  always equals HEAD. The trade: navigating onto/through a checkout whose branch has
-  since advanced resets that branch back to the recorded sha (the later commits stay
-  gc-protected and are reachable by redo). Don't reintroduce keep-the-live-tip.
-- **Global walks every point; local jumps.** `undo N` / `redo N` and the picker on
-  the *global* log step the cursor one entry at a time (`_ou_walk`), because global is
-  an operation log: the same destination commit can leave a *different repo* depending
-  on the path (walking past a branch switch recreates/repoints that branch; a single
-  jump skips it). Walking guarantees `undo N` == N manual undos - what you see is what
-  you get - at the cost of N resets. The *local* log is a single branch with no
-  checkout entries, so walking and jumping are provably identical; it jumps straight
-  to the target (`_ou_local_goto`, one reset) for speed. Counters stay positional
-  (after `undo 3`, redo shows 3) in both: the steps are real. We considered jumping
-  globally too (and grouping `undo N` as one atomic redo) and rejected both - they
-  make `undo N` diverge from manual stepping on cross-branch spans. Don't make global
-  jump.
+  even mishandles `--amend`. So both seeds (navigation and edit, both reading HEAD's
+  reflog) flag the kept entry immediately after each stripped hop and reconstruct only
+  for those. The same labeled hops drive primes in both logs - an edit undo and a nav
+  undo each land a `git-undo:` label in HEAD's reflog. Don't revert to a topological
+  guess, and keep the two seeds symmetric.
+- **Two orthogonal logs, both projections of the HEAD reflog.** Edit (`-e`, per-branch)
+  and navigation (`-n`) are separate append-only logs, each a filter of the *one*
+  durable source: nav keeps the checkout moves, each edit log keeps the edits made while
+  that branch was active. We rejected the old single *mixed* "global operation log": it
+  conflated the two axes (so it had to **walk** to faithfully reverse), it was sampled
+  (so it missed net-zero excursions), and the checkout/edit ambiguity caused the worst
+  blind-test bug ("undo did something I didn't ask"). Splitting the axes makes each
+  atomic and removes the ambiguity. The `-g`/`--global` view *composes* them at query
+  time - derived, never a third stored log (see the next two entries).
+- **Global is a derived merge of the durable oplogs, ordered by stored event time - not
+  a reflog read.** `git undo -g` rebuilds one chronological throughline by merging the
+  two persisted logs on each entry's stored reflog `ts` (nav's captured event time;
+  edit's committer time, with a ff-merge/reset tip-entry overridden to its reflog event
+  time so it doesn't sort at an old commit's age). We first considered deriving it from
+  the HEAD reflog directly - simpler, but it vanishes the moment git expires the reflog,
+  even though the same operations still live in our durable oplogs. Merging the oplogs
+  instead makes the global view as durable as undo/redo. Only a cursor index is stored
+  (`global/cursor`); the throughline is rebuilt each call (so oplog and opstatus agree).
+  Rows sort by `(ts, src, seq)`: ts (the durable event time), then the source log, then
+  the entry's index WITHIN that log. The `seq` key is load-bearing - WITHIN a source it
+  ALWAYS decides same-second order, so a single branch's history is whatever its own log
+  says and can never scramble. We do NOT tiebreak same-second entries by reflog position:
+  a sha repeats in the reflog after any reset / checkout-back (a `reset --hard <ancestor>`
+  leaves a `reset:` entry at an older commit's sha, our own undo a `git-undo` hop there),
+  so a sha-keyed "newest occurrence" rank makes that commit inherit the newer occurrence's
+  recency and reorders the same-second run - which is exactly how a reset rescue once came
+  back non-monotonic (`c1,c3,c2,c4`). The only thing `(ts, src, seq)` gives up is the
+  sub-second order of two DIFFERENT logs' entries in the same wall-clock second (resolved
+  by src, stably); that can't reorder any one log. For that to hold, `src` must be STABLE
+  across calls: branches are assigned src in SORTED order, because the gather order varies
+  between derivations (dir glob vs nav refs, depending on which logs exist yet) and an
+  unstable src would reorder same-second cross-branch entries and invalidate the stored
+  cursor. Don't reintroduce a reflog-sourced (or otherwise stored) global log, don't add a
+  reflog-rank tiebreak, and keep the branch order sorted.
+- **Per-axis cursors self-heal to the real HEAD/tip - but only absorb OUR moves, never a
+  user's edit.** `git undo -g` moves HEAD with labeled checkouts/resets the per-axis syncs
+  skip, so each sync re-anchors its cursor to where HEAD actually is (nav → the current
+  branch/position; edit → the current tip). The hard part is the edit axis: a user's `git
+  reset --hard <ancestor>` and our own undo both just move the branch pointer to an older
+  recorded commit, but they must be handled OPPOSITELY - our hop is absorbed (reposition
+  the cursor), the user's reset is RECORDED (so `git undo` reverses it and recovers the
+  discarded commits). The discriminator is the branch reflog label: our hops read back as
+  `git-undo`/`git-redo`, a user's reset as `reset:`. Generalizing the self-heal to "absorb
+  any move onto a known state" once broke this - it swallowed the user's `reset --hard` for
+  every primed repo, defeating the headline rescue (it only worked on a cold seed). So:
+  reposition only for our own labeled hops (or a vanished branch reflog = the durable
+  global walk); record everything else. This is the orthogonality guarantee AND the reset
+  rescue at once; don't trade one for the other. (See also the edit seed/sync flow.)
+- **`git take` defaults to the branch's latest edit, unstaged; `--staged` is gone from
+  undo/redo.** Bare `git take` grabs the top of the edit log (usual intent: you undid to
+  look around, now want your newest work back), and `git take N` reaches the Nth entry
+  above you. It lands changes **unstaged** by default (`-u`/`-s`, or `undoredo.take`),
+  since staging-by-default proved more annoying than useful. The old `git undo --staged`
+  / `-s` post-step was removed entirely: it was contrived next to "just `git undo`, then
+  `git take`," which expresses the same intent with one orthogonal primitive instead of a
+  flag bolted onto navigation. Don't re-add a staging flag to undo/redo.
+- **The edit log reads HEAD's reflog, not the branch's own.** A branch reflog is deleted
+  by `git branch -d` and never restored on recreate; HEAD's reflog keeps every on-branch
+  edit (attributable by the surrounding `checkout:` messages) and is durable. So the edit
+  log survives a delete+recreate, and a global walk that recreates a branch can still
+  replay its edits. Two clean boundaries fall out and are accepted: off-branch tip-moves
+  (never in HEAD's reflog; live tip-sampling re-catches them) and the detached-commit
+  seam (on no branch). We rejected merging the branch reflog back in for those rare cases
+  - the conditional/merge complexity wasn't worth it.
+- **Navigation is read from the reflog with a count watermark, not sampled.** Position
+  sampling misses a net-zero switch-away-and-back; switches have no rev-list path (unlike
+  commits), so the reflog is their only record. Sync re-reads the new checkouts; the
+  watermark is a count of total reflog entries consumed (`nav/seen`), because identical
+  repeated switch sequences are indistinguishable by content. Our own nav moves are
+  labeled via `GIT_REFLOG_ACTION` on the `checkout` (verified: it relabels the reflog
+  subject), so the seed strips them and `git reflog` stays clean.
+- **Atomic restore per domain - no walk.** An edit restores by one `git reset --hard`
+  of the current branch; a navigation by one `git checkout` to its position (recreating
+  a deleted branch, detaching only for a recorded detached position). `undo N` is a
+  direct jump in both. A log is atomic-jumpable iff every entry is a complete,
+  independently-restorable state - which both are, once the axes are separated. The old
+  global had to walk *only* because it mixed position-moves and content-moves; that need
+  is gone. Don't reintroduce a mixed walking log.
 - **keep-refs for retention.** Navigation must not depend on reflog expiry, so
   every state is pinned by a ref. This also makes retention effectively infinite.
   *Dedup the shas before the batch:* `_ou_keep_all` writes them in one
@@ -266,33 +325,23 @@ that undo/redo inherently produce (and which we strip back out on seed).
   non-consecutively in the reflog after any reset / amend / rebase / branch-switch,
   so without the dedup the seed silently (`2>/dev/null`) protected *nothing* and the
   GC-proof guarantee was a lie on first use. Keep the dedup.
-- **Restore must report failure, never fake success.** `_ou_restore` /
-  `_ou_local_restore` return the reset's exit status, and every caller (`_ou_goto`,
-  `_ou_walk`, `_ou_local_goto`, the undo/redo entry points, the picker) checks it:
-  on a failed reset (e.g. a commit missing on a pre-fix repo) they abort with a clear
-  error and DON'T advance the cursor. The old code ignored the exit, so a destroyed
-  object produced a cheerful success line while HEAD never moved - the worst failure
-  mode for a "nothing is lost" tool. Don't drop the exit checks.
-- **Pull model, no hook.** `sync` captures the *net* HEAD change per command. So two
-  between-run things are invisible to the global log: ops created and abandoned
-  entirely, and - more subtly - an excursion that returns HEAD to the *same commit*
-  (branch off, commit on a side branch, switch back), where the net comparison sees
-  nothing. No data is lost (the side work is on its own ref + the reflog); it's just
-  not in the oplog, so `git undo` won't replay it. The *cold seed* (which reads the
-  whole reflog) DOES see such excursions - only live sync misses them. Detecting them
-  live would mean reading the HEAD reflog for advancement on every command (perf, plus
-  the same "which duplicate entry was the parked one" ambiguity as the keep-ref bug) -
-  declined; the reflog stays the backstop.
-  A `reference-transaction` hook was considered and **declined** for complexity.
-- **Per-commit stitching across gaps, but classify by the reflog top.** A gap of
-  actual commits is reconstructed commit by commit; a gap that's a single non-commit
-  op - a branch switch / ff-merge / rebase to a descendant, or any divergent move -
-  collapses to one op tagged with its real kind (from the reflog top, the same signal
-  the seed uses, so live sync and seed agree). The forward branch must check the kind
-  before stitching, else those moves get mislabeled `commit`. Either way undo lands on
-  a valid keep-ref'd state - gaps never break, they only coarsen granularity. (A
-  *mixed* between-run gap, e.g. commit-then-switch, still coarsens to the last op; we
-  don't correlate each reflog entry to each commit - that ambiguity isn't worth it.)
+- **Restore must report failure, never fake success.** `_ou_nav_restore` /
+  `_ou_local_restore` return their checkout/reset exit status, and every caller
+  (`_ou_nav_goto`, `_ou_local_goto`, the undo/redo entry points, the picker) checks it:
+  on a failure (e.g. a commit missing on a pre-fix repo) they abort with a clear error
+  and DON'T advance the cursor. The old code ignored the exit, so a destroyed object
+  produced a cheerful success line while HEAD never moved - the worst failure mode for a
+  "nothing is lost" tool. Don't drop the exit checks.
+- **No hook; each log catches up from the reflog.** No daemon, no
+  `reference-transaction` hook (considered, declined for complexity). Nav re-reads new
+  checkouts each command against its count watermark - so the net-zero switch-away-and-
+  back that the old *sampled* global missed is now caught. Edit sync samples the branch
+  tip and stitches new commits via `rev-list` (commits have an ancestry path, so they're
+  reconstructable without re-reading the reflog); a forward gap that's a single
+  non-commit op (ff-merge / rebase to a descendant) is recorded as that one op, not
+  mislabeled `commit`, by classifying the reflog top. The detached-commit seam and
+  off-branch tip-moves are the only between-run things still outside the model (both safe
+  in git's reflog) - and they're inherent boundaries, not sampling gaps.
 - **`--reset` rebuilds, it doesn't wipe.** `git oplog --reset` drops the tracked
   state so the next command re-seeds from the reflog - re-deriving is the whole model,
   so a one-entry "anchor at HEAD" would amputate the stitching and lose history before
@@ -347,12 +396,16 @@ that undo/redo inherently produce (and which we strip back out on seed).
   verify their logic by exercising the helpers directly when no pty is available.
 - **Keep the surfaces in sync** when changing the command/flag surface: the script
   help (`_ou_help_*`, `_ou_usage`), the README command table, and `index.html`.
-- **Don't reintroduce rejected designs** (above) - especially: don't make `sync`
-  record only the net HEAD (breaks per-commit undo), don't read the reflog for
-  navigation, and don't let `_ou_restore` detach a branch HEAD (restore onto the
-  recorded branch, recreating it if deleted). If you add a code path that moves
-  HEAD or a branch, label its reflog entry (`GIT_REFLOG_ACTION` for resets,
-  `symbolic-ref -m "git-undo: …"` for switches) so the seed strips it.
+- **Don't reintroduce rejected designs** (above) - especially: don't merge the two logs
+  into one stored "global" log (the global view is *derived* each call by merging the two
+  durable oplogs on their stored event time, never stored as a third log and never
+  re-sourced from the reflog), don't make navigation *sample* the position (read new
+  checkouts from the reflog against the count watermark), don't seed an edit log from a
+  branch's own reflog (use HEAD's, so it survives a delete+recreate), and don't let a
+  per-axis sync trust a stored cursor that no longer matches HEAD (each must self-heal).
+  If you add a code path that moves HEAD or a branch, label its reflog entry with
+  `GIT_REFLOG_ACTION` (for both resets and checkouts) so the seed strips it - and stamp
+  any new timeline entry with its reflog event time so the global merge can order it.
 - Runs anywhere bash + git exist: macOS, Linux, Windows Git-Bash/WSL (and via
   Git-for-Windows' bundled bash, `git undo` works from PowerShell/CMD too).
 ```
