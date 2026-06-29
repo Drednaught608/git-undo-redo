@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT-0
 #
 # Installer for git-undo-redo - works the same on macOS, Linux, and Windows
-# (Git-Bash / WSL). Installs five git subcommands: git undo, git redo,
-# git oplog, git opstatus, git take.
+# (Git-Bash / WSL). Installs three git subcommands: git undo, git redo, git take.
+# (Log/status are flags now: git undo --log / --status.)
 #
 # Usage:
 #   Local (from a clone of this repo):
@@ -12,9 +12,13 @@
 #   Remote one-liner (works in Git-Bash on Windows too):
 #       curl -fsSL https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/install.sh | bash
 #
+#   Uninstall (from a clone, or the same remote link):
+#       ./install.sh --uninstall
+#       curl -fsSL https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/install.sh | bash -s -- --uninstall
+#
 #   Options / env:
 #       --bin DIR           install into DIR (default: $HOME/.local/bin)
-#       --uninstall         remove the installed commands
+#       --uninstall         remove the installed commands (from PATH + the default dir)
 #       GIT_UNDO_REDO_BIN   same as --bin
 #       GIT_UNDO_REDO_SRC   URL to fetch git-undo-redo from when no local copy
 #
@@ -24,8 +28,12 @@ set -euo pipefail
 SRC_URL="${GIT_UNDO_REDO_SRC:-https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/git-undo-redo}"
 BIN_DIR="${GIT_UNDO_REDO_BIN:-$HOME/.local/bin}"
 PRIMARY="git-undo"
-ALIASES=(git-redo git-oplog git-opstatus git-take)
+ALIASES=(git-redo git-take)
 ALL=("$PRIMARY" "${ALIASES[@]}")
+# Commands shipped by older versions that this one no longer installs (oplog/opstatus
+# became `git undo --log` / `--status`). We delete these on install and uninstall so an
+# upgrade doesn't leave stale copies on PATH.
+LEGACY=(git-oplog git-opstatus)
 
 # Did the user pin a directory (--bin / env)? If so we install exactly there;
 # otherwise we may adopt an existing install's location to update it in place.
@@ -36,10 +44,14 @@ BIN_EXPLICIT=0
 # only to a TTY; honors NO_COLOR and `git config undoredo.color` (auto|always|never).
 C_RESET="" C_OK="" C_ERR="" C_WARN="" C_INFO="" C_DIM=""
 _init_colors() {
+    # NOTE: every path must return 0. Under `set -e`, a non-zero return from this
+    # (called as a bare statement) would abort the whole installer - which is exactly
+    # what happens with a plain `return` after a failed `[ -t 1 ]` when stdout is not a
+    # TTY (redirected output, CI, `curl | bash > log`). Use `return 0`.
     case "$(git config --get undoredo.color 2>/dev/null || true)" in
-        never)  return ;;
+        never)  return 0 ;;
         always) ;;
-        *)      { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } || return ;;
+        *)      { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } || return 0 ;;
     esac
     local e=$'\033'
     C_RESET="$e[0m"
@@ -60,20 +72,43 @@ while [ $# -gt 0 ]; do
         --bin)        BIN_DIR="${2:?--bin needs a directory}"; BIN_EXPLICIT=1; shift 2 ;;
         --bin=*)      BIN_DIR="${1#*=}"; BIN_EXPLICIT=1; shift ;;
         --uninstall)  DO_UNINSTALL=1; shift ;;
-        -h|--help)    sed -n '3,20p' "$0" 2>/dev/null || true; exit 0 ;;
+        -h|--help)    sed -n '3,24p' "$0" 2>/dev/null || true; exit 0 ;;
         *)            die "Unknown option: $1" ;;
     esac
 done
 
 # ---- uninstall ------------------------------------------------------
 if [ "$DO_UNINSTALL" -eq 1 ]; then
-    removed=0
-    for n in "${ALL[@]}"; do
-        if [ -e "$BIN_DIR/$n" ] || [ -L "$BIN_DIR/$n" ]; then
-            rm -f "$BIN_DIR/$n" && removed=$((removed + 1))
-        fi
+    # Clean the explicit/default BIN_DIR, AND - unless a directory was pinned with --bin
+    # or the env var - every dir on PATH that actually holds the commands. That makes the
+    # remote one-liner ('curl ... | bash -s -- --uninstall') remove the install wherever
+    # it landed, not just the default location, and sweeps up any leftover duplicate copies.
+    dirs="$BIN_DIR"
+    if [ "$BIN_EXPLICIT" -eq 0 ]; then
+        oldifs=$IFS; IFS=:
+        for d in $PATH; do
+            [ -n "$d" ] && [ -e "$d/$PRIMARY" ] && dirs="$dirs:$d"
+        done
+        IFS=$oldifs
+    fi
+    removed=0 hit="" seen=":"
+    oldifs=$IFS; IFS=:
+    for d in $dirs; do
+        [ -n "$d" ] || continue
+        case "$seen" in *":$d:"*) continue ;; esac   # dedup
+        seen="$seen$d:"
+        for n in "${ALL[@]}" "${LEGACY[@]}"; do       # current + retired command names
+            if [ -e "$d/$n" ] || [ -L "$d/$n" ]; then
+                rm -f "$d/$n" && { removed=$((removed + 1)); case "$hit" in *"$d"*) ;; *) hit="$hit $d" ;; esac; }
+            fi
+        done
     done
-    echo "${C_OK}🧹 Removed $removed command(s) from $BIN_DIR.${C_RESET}"
+    IFS=$oldifs
+    if [ "$removed" -gt 0 ]; then
+        echo "${C_OK}🧹 Removed $removed command(s) from:${C_RESET}${hit}"
+    else
+        echo "${C_DIM}Nothing to remove - no git-undo-redo commands found on PATH or in $BIN_DIR.${C_RESET}"
+    fi
     echo "${C_DIM}   (Your repos' undo/redo tracking lives in each repo's .git and is untouched.)${C_RESET}"
     exit 0
 fi
@@ -88,7 +123,7 @@ case "${BASH_SOURCE[0]:-}" in
 esac
 
 tmp=""
-cleanup() { [ -n "$tmp" ] && rm -f "$tmp"; }
+cleanup() { [ -n "$tmp" ] && rm -f "$tmp"; return 0; }   # return 0: this is the EXIT trap, so its status becomes the script's (a local install leaves tmp empty -> the guard fails -> would exit 1 on success)
 trap cleanup EXIT
 
 if [ -n "$here" ] && [ -f "$here/git-undo-redo" ]; then
@@ -148,6 +183,9 @@ for n in "${ALIASES[@]}"; do
     chmod +x "$BIN_DIR/$n" 2>/dev/null || true
 done
 
+# Remove retired command names from this dir so an upgrade doesn't leave them behind.
+for n in "${LEGACY[@]}"; do rm -f "$BIN_DIR/$n"; done
+
 if [ "$UPDATING" -eq 1 ] && [ "$UNCHANGED" -eq 1 ]; then
     echo "${C_OK}✅ Already up to date: ${ALL[*]}${C_RESET}"
     echo "${C_DIM}   in $BIN_DIR${C_RESET}"
@@ -165,7 +203,7 @@ oldifs=$IFS; IFS=:
 for d in $PATH; do
     if [ -n "$d" ] && [ "$d" != "$BIN_DIR" ] && [ -e "$d/$PRIMARY" ]; then
         echo "${C_WARN}⚠  Another copy is still on your PATH at $d/$PRIMARY${C_RESET}"
-        echo "${C_DIM}   To remove it:  rm -f \"$d\"/git-{undo,redo,oplog,opstatus}${C_RESET}"
+        echo "${C_DIM}   To remove it:  rm -f \"$d\"/git-{undo,redo,take}${C_RESET}"
     fi
 done
 IFS=$oldifs

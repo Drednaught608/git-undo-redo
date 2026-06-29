@@ -7,7 +7,10 @@ Guidance for AI agents (and humans) working on this repo. Read
 `git-undo-redo` - undo/redo for git along its two axes, plus a derived global view. One
 bash script ([`git-undo-redo`](git-undo-redo)) that's a **multi-call binary**: it
 dispatches on `basename "$0"` and is installed (via [`install.sh`](install.sh)) symlinked
-or copied to `git-undo`, `git-redo`, `git-oplog`, `git-opstatus`, `git-take` on `PATH`.
+or copied to `git-undo`, `git-redo`, `git-take` on `PATH`. The old `git-oplog` /
+`git-opstatus` commands were folded into `git undo`/`git redo` as the `--log`/`-l` and
+`--status`/`-s` flags (with `-c`/`--compact` and `-f`/`--full` for log density); the
+removed names still dispatch to a one-line "moved to" hint (`_ou_moved_hint`).
 
 Two orthogonal logs, both seeded from git's **HEAD reflog** then **persisted to disk
 with a per-entry reflog event-time** (so they outlive the reflog): the per-branch **edit
@@ -25,7 +28,7 @@ merges the two durable logs by their stored `ts` into one chronological throughl
 (dropping the nav origin + edit floors, keeping primes) and `_ou_global_walk` walks it,
 dispatching each step to an edit reset or a nav checkout - so `undo -g N` WALKS (the one
 exception to "no walking"). Only `global/cursor` is stored; the throughline is rebuilt
-each call, so `oplog -g` and `opstatus -g` agree. It reads the durable oplogs (not the
+each call, so `git undo --log -g` and `git undo --status -g` agree. It reads the durable oplogs (not the
 reflog), so it survives reflog expiry. Each per-axis sync **self-heals its cursor** to
 where HEAD/the tip actually is, so the three views stay orthogonal and correct after a
 global walk or a manual `git` move.
@@ -61,6 +64,15 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   no longer matches HEAD (each must self-heal). Label any HEAD/branch move the tool makes
   with `GIT_REFLOG_ACTION` (resets AND checkouts) so the seed strips it; stamp any new
   timeline entry with its reflog event time so the global merge can order it.
+- **The global cursor is only valid inside a LIVE walk - guard it with the throughline
+  length, not just sha/ref.** A position (sha, ref) repeats in the throughline (a branch
+  revisited at the same commit), so "stored index still matches HEAD's sha/ref" is NOT
+  enough to trust it: after a per-axis op moves HEAD on another axis (a `git undo -n` then
+  a manual switch, a commit, etc.) the stored index can match HEAD at an *older duplicate*
+  occurrence, making the global log disagree with the nav/edit logs and offer phantom redo.
+  `_ou_global_goto` stores the index AND `${#GL_SHA[@]}`; the derive trusts it only when the
+  length is unchanged (a pure global walk appends nothing), else re-anchors to where HEAD
+  actually is (newest matching occurrence, kind-aware). Don't drop the length guard.
 - **Two orthogonal logs, both durable HEAD-reflog projections.** The navigation log
   (`.git/git-undo-redo/nav/`, entries `<sha>\t<kind>\t<ref>\t<ts>`) is the reflog's
   checkout moves; each edit log (`.git/git-undo-redo/local/<branch>/`, entries
@@ -86,11 +98,22 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   reflog entry) so a reset after a global walk doesn't inject a spurious prime.
 - **Keep the surfaces in sync** when the command/flag surface changes: the script
   help (`_ou_help_*`, `_ou_usage`), the README command table, and `index.html`.
+- **Exit-code convention: `undo`/`redo`/`take` exit 0 iff the requested end-state is
+  reached, 1 when it could not be.** A no-op that means "couldn't do what you asked" -
+  at the oldest/newest boundary, asked for more steps than exist, or nothing left to take
+  (all the red 🛑 paths) - returns 1, like the "too many" case; don't let one of these
+  drift back to `return 0`. The exceptions that stay 0: an explicit zero-count request
+  (`undo 0`), a read-only view (`git undo --log`/`--status` on empty history), and a `take`
+  whose tree is already present (idempotent success - reported as "Already taken", not
+  "Took"). `take` detects that no-op by diffing full `git status` (untracked included)
+  across the apply, since an add-only commit lands untracked and slips past the
+  tracked-only clean check.
 - All flags have long + short forms **except `--reset`** (long-only by design, so
-  it can't be fat-fingered). `git oplog --reset` rebuilds the oplog from the reflog
-  (it does NOT wipe - re-deriving is the model; never anchor a single entry instead).
+  it can't be fat-fingered). `git undo --reset` (and `git redo --reset`) rebuilds the
+  oplog from the reflog (it does NOT wipe - re-deriving is the model; never anchor a
+  single entry instead). `--status`/`--log`/`--interactive` are mutually exclusive views.
   No within-command duplicate short letters. Defaults:
-  `undoredo.default` (global|edit|navigation; default global), `undoredo.oplog` (full|compact),
+  `undoredo.scope` (global|edit|navigation; default global), `undoredo.log` (full|compact),
   `undoredo.take` (unstaged|staged), and `undoredo.color` (auto|always|never); flags
   override.
 - **Output color** is via the `C_*` vars set by `_ou_colors` (empty unless a TTY /
@@ -108,7 +131,7 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   protects nothing. (2) `_ou_nav_restore`/`_ou_local_restore` return their exit and
   every caller checks it: a failed restore must error and NOT advance the cursor, never
   print a success line. Don't remove the dedup or the exit checks.
-- **The global derive runs on every `oplog`/`opstatus`/`undo`/`redo`, so its hot path is
+- **The global derive runs on every `git undo`/`git redo` (the action and its `--status`/`--log`/`-i` views), so its hot path is
   fork-disciplined: on Windows MSYS every `$(...)`, pipe, and external command is an
   emulated `fork()` that dominates runtime (a process spawn costs far more than the work).
   Prefer builtins - parameter expansion over `basename`/`dirname`/`tr`/`cut`, `read -r var

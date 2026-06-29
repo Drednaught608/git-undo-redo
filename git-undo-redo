@@ -162,24 +162,24 @@ _ou_local_dir_for() { local e="$1"; e="${e//%/%25}"; e="${e////%2F}"; printf '%s
 # User preferences, read once per run by _ou_load_config in a SINGLE git call for
 # all undoredo.* keys (per-process cache, so a `git config` change is picked up on
 # the next command - nothing is persisted). Flag overrides are applied by callers.
-#   undoredo.default = global | edit | navigation (default global) - bare undo/redo/oplog/opstatus
-#   undoredo.oplog   = full   | compact (default full)   - default git oplog view
+#   undoredo.scope = global | edit | navigation (default global) - bare undo/redo scope
+#   undoredo.log   = full   | compact (default full)   - default 'git undo --log' density
 #   undoredo.color   = auto   | always | never (default auto, color to a TTY)
 #   undoredo.take    = unstaged | staged (default unstaged) - whether git take stages
-OU_CFG_DEFAULT="" OU_CFG_OPLOG="" OU_CFG_COLOR="" OU_CFG_TAKE=""
+OU_CFG_SCOPE="" OU_CFG_LOG="" OU_CFG_COLOR="" OU_CFG_TAKE=""
 _ou_load_config() {
     local k v
     while read -r k v; do
         case "$k" in
-            undoredo.default) OU_CFG_DEFAULT="$v" ;;
-            undoredo.oplog)   OU_CFG_OPLOG="$v"   ;;
-            undoredo.color)   OU_CFG_COLOR="$v"   ;;
-            undoredo.take)    OU_CFG_TAKE="$v"    ;;
+            undoredo.scope) OU_CFG_SCOPE="$v" ;;
+            undoredo.log)   OU_CFG_LOG="$v"   ;;
+            undoredo.color) OU_CFG_COLOR="$v" ;;
+            undoredo.take)  OU_CFG_TAKE="$v"  ;;
         esac
     done < <(git config --get-regexp '^undoredo\.' 2>/dev/null)   # last value wins, like --get
 }
-_ou_cfg_default()       { case "$OU_CFG_DEFAULT" in edit) printf 'edit' ;; navigation|nav) printf 'navigation' ;; *) printf 'global' ;; esac; }
-_ou_cfg_oplog_compact() { case "$OU_CFG_OPLOG"   in compact) printf '1' ;;   *) printf '0' ;;      esac; }
+_ou_cfg_scope()       { case "$OU_CFG_SCOPE" in edit) printf 'edit' ;; navigation|nav) printf 'navigation' ;; *) printf 'global' ;; esac; }
+_ou_cfg_log_compact() { case "$OU_CFG_LOG"   in compact) printf '1' ;;   *) printf '0' ;;      esac; }
 _ou_cfg_take()          { case "$OU_CFG_TAKE"    in staged) printf 'staged' ;; *) printf 'unstaged' ;; esac; }
 
 # Populate the C_* color vars (truecolor, palette from the landing page's terminal
@@ -489,7 +489,7 @@ _ou_undo_nav() {
     avail=$NCUR
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to undo: already at the oldest recorded position.${C_RESET}"
-        return 0
+        return 1   # asked to undo, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
         echo "${C_ERR}🛑 Only $(_ou_qty "$avail" move) available to undo; you asked for $count. Nothing changed.${C_RESET}"
@@ -512,7 +512,7 @@ _ou_redo_nav() {
     avail=$(( last - NCUR ))
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to redo: already at the most recent position.${C_RESET}"
-        return 0
+        return 1   # asked to redo, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
         echo "${C_ERR}🛑 Only $(_ou_qty "$avail" move) available to redo; you asked for $count. Nothing changed.${C_RESET}"
@@ -703,11 +703,18 @@ _ou_global_derive() {
     # ...") is an edit landing, a bare checkout hop ("git-undo") is a navigation landing.
     # That keeps an edit-undo to a twice-visited commit on the commit point, not the
     # later switch-back. Fall back to the newest occurrence when there is no tool hop.
-    local hn hb stored=-1; hn="$_OU_HEAD"; hb="${_OU_BRANCH:-}"   # cached; derive runs before any walk
+    # Trusting the stored index also requires the throughline to be UNCHANGED since it was
+    # written (storedlen): a stored cursor is only meaningful inside a live global walk. A
+    # per-axis op that appends an entry (a user switch/commit/reset, or a resume-point prime
+    # from a per-axis undo+move) moves HEAD on another axis and leaves the stored index
+    # pointing at a now-older DUPLICATE of HEAD's position - which the sha/ref check alone
+    # cannot tell apart - so any length change forces a re-anchor to where HEAD really is.
+    local hn hb stored=-1 storedlen=-1; hn="$_OU_HEAD"; hb="${_OU_BRANCH:-}"   # cached; derive runs before any walk
     # [ -r ] guards the redirect: `read < missing 2>/dev/null` still leaks the open error
     # (the input redirect is applied before 2>). Reading from a file does not fork.
-    [ -r "$_OU_SDIR/global/cursor" ] && read -r stored < "$_OU_SDIR/global/cursor"
+    [ -r "$_OU_SDIR/global/cursor" ] && { read -r stored; read -r storedlen; } < "$_OU_SDIR/global/cursor"
     if [ "$stored" -ge 0 ] && [ "$stored" -lt "${#GL_SHA[@]}" ] \
+       && [ "$storedlen" = "${#GL_SHA[@]}" ] \
        && [ "${GL_SHA[$stored]}" = "$hn" ] && [ "${GL_REF[$stored]}" = "$hb" ]; then
         GCUR=$stored
     else
@@ -756,7 +763,12 @@ _ou_global_dir() { printf '%s/global' "${_OU_SDIR:-$(_ou_state_dir)}"; }
 _ou_global_goto() {
     _ou_global_restore "${GL_SHA[$1]}" "${GL_REF[$1]}" "${2:-git-undo}" || return 1
     _ou_branch_dirty   # a global step may have switched branches
-    GCUR="$1"; local gd="$_OU_SDIR/global"; [ -d "$gd" ] || mkdir -p "$gd"; printf '%s\n' "$GCUR" > "$gd/cursor"
+    GCUR="$1"; local gd="$_OU_SDIR/global"; [ -d "$gd" ] || mkdir -p "$gd"
+    # Store the throughline length alongside the index: the cursor is only a LIVE global
+    # walk while the throughline is unchanged. If a later per-axis op appends an entry, the
+    # stored index is stale (it can still match HEAD's sha/ref at an older duplicate), so
+    # the derive must re-anchor rather than trust it. See _ou_global_derive's cursor logic.
+    printf '%s\n%s\n' "$GCUR" "${#GL_SHA[@]}" > "$gd/cursor"
 }
 
 # Walk one entry at a time - each step reverses/reapplies one operation in order.
@@ -784,10 +796,10 @@ _ou_global_where() {
 _ou_undo_global() {
     local count="${1:-1}" avail
     _ou_require_clean   || return 1
-    _ou_global_derive   || { echo "${C_DIM}No history to undo yet.${C_RESET}"; return 0; }
+    _ou_global_derive   || { echo "${C_DIM}No history to undo yet.${C_RESET}"; return 1; }
     avail=$GCUR
     if [ "$avail" -le 0 ]; then
-        echo "${C_ERR}🛑 Nothing to undo: already at the oldest recorded state.${C_RESET}"; return 0
+        echo "${C_ERR}🛑 Nothing to undo: already at the oldest recorded state.${C_RESET}"; return 1
     fi
     if [ "$count" -gt "$avail" ]; then
         echo "${C_ERR}🛑 Only $(_ou_qty "$avail" step) available to undo; you asked for $count. Nothing changed.${C_RESET}"; return 1
@@ -801,10 +813,10 @@ _ou_undo_global() {
 _ou_redo_global() {
     local count="${1:-1}" last avail
     _ou_require_clean   || return 1
-    _ou_global_derive   || { echo "${C_DIM}No history to redo yet.${C_RESET}"; return 0; }
+    _ou_global_derive   || { echo "${C_DIM}No history to redo yet.${C_RESET}"; return 1; }
     last=$(( ${#GL_SHA[@]} - 1 )); avail=$(( last - GCUR ))
     if [ "$avail" -le 0 ]; then
-        echo "${C_ERR}🛑 Nothing to redo: already at the most recent state.${C_RESET}"; return 0
+        echo "${C_ERR}🛑 Nothing to redo: already at the most recent state.${C_RESET}"; return 1
     fi
     if [ "$count" -gt "$avail" ]; then
         echo "${C_ERR}🛑 Only $(_ou_qty "$avail" step) available to redo; you asked for $count. Nothing changed.${C_RESET}"; return 1
@@ -1096,7 +1108,7 @@ _ou_undo_local() {
     avail=$LCUR
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to undo on branch $branch: already at its oldest edit.${C_RESET}"
-        return 0
+        return 1   # asked to undo, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
         echo "${C_ERR}🛑 Only $(_ou_qty "$avail" edit) available to undo on branch $branch; you asked for $count. Nothing changed.${C_RESET}"
@@ -1126,7 +1138,7 @@ _ou_redo_local() {
     avail=$(( last - LCUR ))
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to redo on branch $branch: already at its most recent edit.${C_RESET}"
-        return 0
+        return 1   # asked to redo, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
         echo "${C_ERR}🛑 Only $(_ou_qty "$avail" edit) available to redo on branch $branch; you asked for $count. Nothing changed.${C_RESET}"
@@ -1162,7 +1174,7 @@ _ou_take() {
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing above the current point on branch $branch to take.${C_RESET}"
         echo "   ${C_DIM}'git take' grabs a commit you've moved below - e.g. right after 'git undo'.${C_RESET}"
-        return 0
+        return 1   # asked to take, nothing to take: a no-op exits non-zero
     fi
     if [ -z "$count" ]; then
         # Bare take = the branch's latest edit, but SKIP a trailing reset. A reset moves
@@ -1176,9 +1188,9 @@ _ou_take() {
             target=$(( target - 1 ))
         done
         if [ "$target" -le "$LCUR" ]; then
-            echo "${C_DIM}🛑 Nothing newer to take above the current point on branch $branch - its latest edit is a reset (a backward move).${C_RESET}"
+            echo "${C_ERR}🛑 Nothing newer to take above the current point on branch $branch - its latest edit is a reset (a backward move).${C_RESET}"
             echo "   ${C_DIM}'git take N' can still grab a specific commit above you.${C_RESET}"
-            return 0
+            return 1
         fi
     else
         if [ "$count" -gt "$avail" ]; then
@@ -1188,9 +1200,20 @@ _ou_take() {
         target=$(( LCUR + count ))
     fi
     above="${LT_SHA[$target]}"
+    # Detect a re-take that changes nothing. A taken commit that only ADDS files lands
+    # them untracked, which the tracked-only clean check ignores - so a second 'git take'
+    # re-applies the same tree silently. Compare full status (untracked included) across
+    # the apply and report the no-op honestly instead of a misleading "Took the changes".
+    local _pre _post
+    _pre=$(git status --porcelain --untracked-files=all 2>/dev/null)
     if ! _ou_take_apply "$above" "$mode"; then
         echo "${C_ERR}❌ Could not take from $(_ou_short "$above") - is the commit still present?${C_RESET}" >&2
         return 1
+    fi
+    _post=$(git status --porcelain --untracked-files=all 2>/dev/null)
+    if [ "$_pre" = "$_post" ]; then
+        echo "${C_DIM}↥ Already taken from $(_ou_short "$above") - your working tree already matches it; nothing to do.${C_RESET}"
+        return 0   # the changes are present (idempotent), so this is success, not a failure
     fi
     if [ "$mode" = staged ]; then
         echo "${C_OK}↥ Took the changes from $(_ou_short "$above")${C_RESET} - staged onto $(_ou_short), edit and commit."
@@ -1205,176 +1228,96 @@ _ou_usage() {
     cat <<'EOF'
 git undo/redo - operation-level undo/redo for git, tracked in an orthogonal oplog.
 
-Subcommands (install as git-undo, git-redo, git-oplog, git-opstatus, git-take on PATH):
+Commands (installed as git-undo, git-redo, git-take on PATH):
   git undo        Step back your most recent operation across both your edits and
-                  branch switches, in time order. Add -e to limit it to this branch's
-                  edits, or -n to a branch switch / checkout.
-  git redo        Re-apply the operation you last undid (-e / -n to scope it).
-  git oplog       Show the global operation log (-e for this branch's edits, -n for
-                  the navigation log).
-  git opstatus    Show where you are and how many undo/redo steps remain.
-  git take        Copy a commit's changes into your files without moving HEAD -
-                  e.g. 'git undo' to look back, then 'git take' to pull your latest
-                  work in. 'git take N' takes the Nth commit above you instead.
+                  branch switches, in time order (-e for this branch's edits, -n for a
+                  branch switch). Add --status to see where you are, --log to list the
+                  history, or -i to pick a point to jump to.
+  git redo        Re-apply the operation you last undid (same flags as git undo).
+  git take        Copy a commit's changes into your files without moving HEAD - e.g.
+                  'git undo' to look back, then 'git take' to pull your latest work in.
 
-Run any subcommand with -h for details. (git reserves '--help' for its own manual
-pages, so `git undo --help` looks for a man page, not this text - use -h here.)
+Run any command with -h for details. (git reserves '--help' for its own manual pages,
+so `git undo --help` looks for a man page, not this text - use -h here.)
 
 Notes:
   * Undo/redo need a clean working tree (untracked files are fine).
   * `git undo N` / `git redo N` do N at once; they refuse (changing nothing) if N
     is more than available, and tell you how many there are.
   * The logs are append-only - undoing then acting never loses history.
-  * Global (-g, default) undoes your most recent operation across both axes, in
-    chronological order; edit (-e) undoes the current branch's own edits; navigation
-    (-n) undoes branch switches / checkouts (one atomic checkout). Set the default
-    scope with `git config undoredo.default` (global|edit|navigation), the oplog view with
-    `git config undoredo.oplog` (full|compact), whether `git take` stages with
-    `git config undoredo.take` (unstaged|staged), and color with
-    `git config undoredo.color` (auto|always|never).
+  * Scope: global (-g, default) spans both axes in time order; edit (-e) is the current
+    branch's edits; navigation (-n) is branch switches. Set defaults with
+    `git config undoredo.scope` (global|edit|navigation), the log density with
+    `undoredo.log` (full|compact), whether `git take` stages with `undoredo.take`
+    (unstaged|staged), and color with `undoredo.color` (auto|always|never).
 EOF
 }
 
 _ou_help_undo() {
     cat <<'EOF'
-git undo - step back your most recent operation (global, the default), or just an
-edit on this branch (-e) or a branch switch (-n).
+git undo - step back your most recent operation, or look at the history without moving.
 
-Usage: git undo [N] [-g|--global | -e|--edit | -n|--navigation] [-i|--interactive] [-h]
+Usage: git undo [N] [-e | -n | -g] [-s | -l | -i] [-c | -f] [-h]
 
-Global (default): steps back your single most recent operation across BOTH axes, in
-chronological order - whatever you did last, be it a commit, a branch switch, or a
-reset. Each step is dispatched to its own axis (an edit reset or a nav checkout), so a
-step can move you to another branch (the message names where you land); 'undo -g N'
-WALKS N steps, so it equals N undos. It is composed live from the two logs and stored
-as nothing but a cursor.
+By default it reverses your last action across everything (commit, branch switch,
+reset - whatever came last) and tells you where you land. Pass a number to step back
+several at once (e.g. 'git undo 3'); if that is more than exist, it refuses and says
+how many there are. Requires a clean working tree (untracked files are fine).
 
-Edit (-e): steps back one *edit* on the branch you're currently on - commit, reset,
-merge, rebase, amend - using that branch's own log. It stays on your branch and moves
-only its tip, so you can switch to any branch and undo its last edit.
+Scope - applies to the action AND the views below; with none, follows
+'git config undoredo.scope' (default global):
+  -g, --global      Across everything, in time order. The DEFAULT. A step can land you
+                    on another branch; 'undo -g 3' walks three steps (= three undos).
+  -e, --edit        Just this branch's edits (commit, reset, merge, rebase, amend).
+  -n, --navigation  Just branch switches / checkouts.
 
-Navigation (-n): steps back one *position change* - a branch switch / checkout
-(including detached). It's a single atomic checkout to where you were, never a
-walk. Works on a detached HEAD too.
+Look instead of move (read-only; redo takes these too, showing the same thing):
+  -s, --status      Show where you are and how many undo/redo steps remain.
+  -l, --log         Show the operation log (newest first; '@' marks your position).
+  -i, --interactive Open that log as a picker and jump to a point you choose
+                    ('t' toggles resume points).
+  -c, --compact     Condense the log/picker (hide resume points); overrides config.
+  -f, --full        Show every entry in the log/picker; overrides config.
 
-Pass a number N to undo that many at once (e.g. `git undo 3`). If N is more than
-are available it refuses, changing nothing, and tells you how many there are.
-
-With no scope flag, the scope is set by `git config undoredo.default`
-(global|edit|navigation; default global). Requires a clean working tree; untracked
-files are fine.
-
-Options:
+Other:
   N                 Undo N steps at once (default 1).
-  -g, --global      Undo your last operation across BOTH axes, in chronological order
-                    (commit, switch, reset - whatever was most recent). The DEFAULT.
-                    Walks one step at a time, so 'undo -g 3' equals three undos.
-                    Composed live from the edit and navigation logs; nothing stored.
-  -e, --edit        Undo the last edit on the current branch only.
-  -n, --navigation  Undo the last branch switch / checkout (one atomic checkout).
-  -i, --interactive Open the picker for the chosen scope (global by default, -e for
-                    edit, -n for navigation) and drop straight to a point you choose
-                    ('t' toggles resume points). Like 'git oplog -i'.
-  -h                Show this help. (git owns '--help' - 'git undo --help' goes to
-                    git's manual lookup, not here; -h is the help flag.)
+      --reset       Rebuild the log from git's reflog (maintenance; long form only).
+  -h                Show this help. ('git undo --help' is taken over by git's own
+                    documentation lookup; use -h here, or 'git-undo --help' directly.)
 
-To keep a commit's changes while undoing past it, undo as normal, then run
-'git take' to copy your latest work back into the tree (see 'git take -h').
-
-At the oldest tracked point, undo stops. Anything older lives in git's own
-reflog (`git reflog`), your durable backstop.
+To keep a commit's changes while undoing past it, undo as normal, then run 'git take'
+(see 'git take -h').
 EOF
 }
 
 _ou_help_redo() {
     cat <<'EOF'
-git redo - re-apply the operation you last undid (global, the default), or just an
-edit (-e) or a branch switch (-n).
+git redo - re-apply the operation you last undid, or look at the history without moving.
 
-Usage: git redo [N] [-g|--global | -e|--edit | -n|--navigation] [-i|--interactive] [-h]
+Usage: git redo [N] [-e | -n | -g] [-s | -l | -i] [-c | -f] [-h]
 
-Re-applies what you undid: global (default) steps forward across both axes in
-chronological order (and walks, so a step can move you to another branch); edit (-e)
-steps forward through the current branch's own edits; navigation (-n) through your
-position changes (one atomic checkout). Pass a number N to redo that many at once
-(e.g. `git redo 2`); it refuses, changing nothing, if N is more than are available.
-With no scope flag, the scope is `git config undoredo.default` (default global). Acting
-after undoing never discards what you undid past, so redo is available until you do
-something new. Requires a clean working tree.
+By default it re-applies your last undone action across everything. Pass a number to
+redo several at once (e.g. 'git redo 2'); it refuses, changing nothing, if that is more
+than were undone. Redoing never discards anything, so it stays available until you make
+a new change. Requires a clean working tree.
 
-Options:
-  N                 Redo N steps at once (default 1).
-  -g, --global      Redo your last undone operation across both axes, in order (walks).
-                    The DEFAULT.
-  -e, --edit        Redo the last undone edit on the current branch only.
-  -n, --navigation  Redo the last undone branch switch / checkout (atomic).
-  -i, --interactive Open the picker for the chosen scope (global by default, -e for
-                    edit, -n for navigation) and drop straight to a point you choose
-                    ('t' toggles resume points). Like 'git oplog -i'.
-  -h                Show this help. (git owns '--help' - 'git redo --help' goes to
-                    git's manual lookup, not here; -h is the help flag.)
-EOF
-}
+Scope (applies to the action and the views; default from 'git config undoredo.scope'):
+  -g, --global      Across everything, in time order. The DEFAULT.
+  -e, --edit        Just this branch's edits.
+  -n, --navigation  Just branch switches / checkouts.
 
-_ou_help_oplog() {
-    cat <<'EOF'
-git oplog - show the global operation log (default), this branch's edit log (-e),
-or the navigation log (-n).
-
-Usage: git oplog [-g|--global | -e|--edit | -n|--navigation] [-c|--compact | -f|--full]
-                 [-i|--interactive] [--reset] [-h]
-
-Lists every tracked entry (oldest at the bottom), each tagged with its kind, with
-your current position marked '@'. The logs are append-only: when you act after
-undoing, a resume point of the state you carried on from is inserted first, so nothing
-you undid past is ever lost. A resume point shows the underlying kind marked with '↻',
-e.g. '↻ commit' (edit log) / '↻ checkout' (navigation log).
-
-Scope:
-  -g, --global      Show both axes composed into one chronological log (every edit
-                    and switch in time order), derived live from the two logs. Default.
-  -e, --edit        Show the current branch's own edit log.
-  -n, --navigation  Show the navigation log (branch switches / checkouts).
-                    With none of these, follows `git config undoredo.default`.
-
-Views:
-  -f, --full        Show every entry, including resume points (↻) (default).
-  -c, --compact     Hide resume points for a cleaner list.
-  -i, --interactive Show the log and drop straight to a point you pick (combine
-                    with -e/-n and -c/-f; press 't' in the picker to toggle the
-                    view). A cursor move, not a new operation. Also reachable as
-                    'git undo -i' / 'git redo -i', which honor -e/-n the same way.
-
-The default view (full or compact) can be set with `git config undoredo.oplog`.
+Look instead of move (read-only; identical to 'git undo's views):
+  -s, --status      Where you are and how many undo/redo steps remain.
+  -l, --log         The operation log (newest first; '@' marks your position).
+  -i, --interactive The log as a picker; jump to a point you choose ('t' toggles
+                    resume points).
+  -c, --compact / -f, --full   Condense / expand the log and picker; override config.
 
 Other:
-      --reset   Drop the tracked logs (navigation + per-branch edit logs, keep-refs)
-                so they rebuild cleanly from git's reflog on the next command. A
-                rebuild, not a wipe: recent history stitches back in; what's dropped
-                is accumulated tracking older than the reflog, prime anchors, and any
-                wedged state. Your commits and files are untouched. Long form only.
-  -h            Show this help. (git owns '--help' - 'git oplog --help' goes to
-                git's manual lookup, not here; -h is the help flag.)
-EOF
-}
-
-_ou_help_opstatus() {
-    cat <<'EOF'
-git opstatus - show where you are and how many undo/redo steps remain.
-
-Usage: git opstatus [-g|--global | -e|--edit | -n|--navigation] [-h]
-
-Prints the current HEAD and how many undo and redo steps are available, across both
-axes in chronological order (global, the default), for the current branch's edits
-(-e), or for the navigation log (-n). With none of these, follows `git config
-undoredo.default`.
-
-Options:
-  -g, --global     Count operations across both axes, in chronological order. Default.
-  -e, --edit       Count edit steps on the current branch.
-  -n, --navigation Count navigation steps (branch switches / checkouts).
-  -h               Show this help. (git owns '--help' - 'git opstatus --help' goes
-                   to git's manual lookup, not here; -h is the help flag.)
+  N                 Redo N steps at once (default 1).
+      --reset       Rebuild the log from git's reflog (maintenance; long form only).
+  -h                Show this help. ('git redo --help' is taken by git; use -h here,
+                    or 'git-redo --help' directly.)
 EOF
 }
 
@@ -1398,7 +1341,7 @@ By default the changes land UNSTAGED (ordinary working-tree edits). Use -s to st
 them instead, or set a default with `git config undoredo.take` (unstaged|staged).
 
 Unlike undo/redo, take never moves you - it only copies files. It is always edit-
-based, reading the current branch's own log (the same one 'git oplog' shows).
+based, reading the current branch's own log (the same one 'git undo --log -e' shows).
 Requires a clean working tree and a branch (not a detached HEAD). Refuses, changing
 nothing, if there's nothing above you (or fewer than N commits, for 'git take N').
 
@@ -1435,16 +1378,24 @@ _ou_unbundle() {
     done
 }
 
+# Action by default; a view flag (--status/--log/--interactive) looks instead of moves.
+# All of them honor the scope flags (-g/-e/-n) and the undoredo.scope config.
 git-undo() {
-    local mode="" interactive=0 count=1
+    local mode="" view="" count=1 compact
+    compact=$(_ou_cfg_log_compact)        # default log density; -c/-f override
     local _ua; mapfile -t _ua < <(_ou_unbundle "$@"); set -- ${_ua[@]+"${_ua[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)        _ou_help_undo; return 0 ;;
+            --reset)          _ou_reset; return $? ;;
             -e|--edit)        mode=edit ;;
             -n|--navigation)  mode=navigation ;;
             -g|--global)      mode=global ;;
-            -i|--interactive) interactive=1 ;;
+            -s|--status)      case "$view" in ""|status)      view=status ;;      *) view=CONFLICT ;; esac ;;
+            -l|--log)         case "$view" in ""|log)         view=log ;;         *) view=CONFLICT ;; esac ;;
+            -i|--interactive) case "$view" in ""|interactive) view=interactive ;; *) view=CONFLICT ;; esac ;;
+            -c|--compact)     compact=1 ;;
+            -f|--full)        compact=0 ;;
             *)  case "$1" in
                     ''|*[!0-9]*) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_undo >&2; return 2 ;;
                     *)           count=$((10#$1)) ;;     # bare number = how many to undo
@@ -1452,15 +1403,17 @@ git-undo() {
         esac
         shift
     done
+    [ "$view" = CONFLICT ] && { echo "${C_ERR}Choose only one of --status, --log, --interactive.${C_RESET}" >&2; return 2; }
     _ou_require_repo  || return 1
-    [ -z "$mode" ] && mode=$(_ou_cfg_default)
+    [ -z "$mode" ] && mode=$(_ou_cfg_scope)
 
-    if [ "$interactive" -eq 1 ]; then
-        _ou_show "$mode" "$(_ou_cfg_oplog_compact)" 1   # picker honors -e/-n/-g/default
-        return $?
-    fi
+    case "$view" in                                     # a view flag looks instead of moving
+        status)      _ou_status_show "$mode"; return $? ;;
+        log)         _ou_show "$mode" "$compact" 0; return $? ;;
+        interactive) _ou_show "$mode" "$compact" 1; return $? ;;
+    esac
+
     [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to undo (0 requested).${C_RESET}"; return 0; }
-
     case "$mode" in
         navigation) _ou_undo_nav "$count" ;;
         global)     _ou_undo_global "$count" ;;
@@ -1469,15 +1422,21 @@ git-undo() {
 }
 
 git-redo() {
-    local mode="" interactive=0 count=1
+    local mode="" view="" count=1 compact
+    compact=$(_ou_cfg_log_compact)        # default log density; -c/-f override
     local _ua; mapfile -t _ua < <(_ou_unbundle "$@"); set -- ${_ua[@]+"${_ua[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)        _ou_help_redo; return 0 ;;
+            --reset)          _ou_reset; return $? ;;
             -e|--edit)        mode=edit ;;
             -n|--navigation)  mode=navigation ;;
             -g|--global)      mode=global ;;
-            -i|--interactive) interactive=1 ;;
+            -s|--status)      case "$view" in ""|status)      view=status ;;      *) view=CONFLICT ;; esac ;;
+            -l|--log)         case "$view" in ""|log)         view=log ;;         *) view=CONFLICT ;; esac ;;
+            -i|--interactive) case "$view" in ""|interactive) view=interactive ;; *) view=CONFLICT ;; esac ;;
+            -c|--compact)     compact=1 ;;
+            -f|--full)        compact=0 ;;
             *)  case "$1" in
                     ''|*[!0-9]*) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_redo >&2; return 2 ;;
                     *)           count=$((10#$1)) ;;     # bare number = how many to redo
@@ -1485,15 +1444,17 @@ git-redo() {
         esac
         shift
     done
+    [ "$view" = CONFLICT ] && { echo "${C_ERR}Choose only one of --status, --log, --interactive.${C_RESET}" >&2; return 2; }
     _ou_require_repo  || return 1
-    [ -z "$mode" ] && mode=$(_ou_cfg_default)
+    [ -z "$mode" ] && mode=$(_ou_cfg_scope)
 
-    if [ "$interactive" -eq 1 ]; then
-        _ou_show "$mode" "$(_ou_cfg_oplog_compact)" 1   # picker honors -e/-n/-g/default
-        return $?
-    fi
+    case "$view" in                                     # the views are read-only and identical to undo's
+        status)      _ou_status_show "$mode"; return $? ;;
+        log)         _ou_show "$mode" "$compact" 0; return $? ;;
+        interactive) _ou_show "$mode" "$compact" 1; return $? ;;
+    esac
+
     [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to redo (0 requested).${C_RESET}"; return 0; }
-
     case "$mode" in
         navigation) _ou_redo_nav "$count" ;;
         global)     _ou_redo_global "$count" ;;
@@ -1522,22 +1483,10 @@ git-take() {
     _ou_take "$count" "$mode"
 }
 
-git-undo-status() {
-    local mode="" branch d last
-    local _ua; mapfile -t _ua < <(_ou_unbundle "$@"); set -- ${_ua[@]+"${_ua[@]}"}
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -h|--help)       _ou_help_opstatus; return 0 ;;
-            -n|--navigation) mode=navigation ;;
-            -e|--edit)       mode=edit ;;
-            -g|--global)     mode=global ;;
-            *)               echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_opstatus >&2; return 2 ;;
-        esac
-        shift
-    done
-    _ou_require_repo || return 1
-    [ -z "$mode" ] && mode=$(_ou_cfg_default)   # neither flag: follow undoredo.default
-
+# Render the status summary - where HEAD is, plus how many undo/redo steps remain - for
+# the given scope. Read-only; backs `git undo --status` / `git redo --status` (-g/-e/-n).
+_ou_status_show() {
+    local mode="$1" branch d last
     if [ "$mode" = "global" ]; then
         _ou_global_derive readonly || { echo "${C_DIM}No history recorded yet.${C_RESET}"; return 0; }
         last=$(( ${#GL_SHA[@]} - 1 ))
@@ -1560,7 +1509,7 @@ git-undo-status() {
         branch=$(_ou_branch)
         if [ -z "$branch" ]; then
             echo "${C_ERR}❌ The edit log is per-branch, but HEAD is detached.${C_RESET}"
-            echo "   Use 'git opstatus --navigation' for the navigation log."
+            echo "   Use 'git undo --status --navigation' for the navigation log."
             return 1
         fi
         d=$(_ou_local_dir)            || return 1
@@ -1700,8 +1649,8 @@ _ou_oplog_interactive() {
 
 # Show a log for a scope: print it, or (interactive) open the picker. $1=mode
 # (global|local), $2=compact (0/1 initial view), $3=interactive (0/1). Loads the
-# chosen log into TL_SHA/TL_KIND/CUR. Shared by `git oplog`, `git undo -i`, and
-# `git redo -i` so all three honor -g/-l and undoredo.default identically.
+# chosen log into TL_SHA/TL_KIND/CUR. Shared by `git undo --log` / `--interactive`
+# (and the redo equivalents) so they honor -g/-e/-n and undoredo.scope identically.
 _ou_show() {
     local mode="$1" compact="$2" interactive="$3" branch d
     if [ "$mode" = "global" ]; then
@@ -1725,7 +1674,7 @@ _ou_show() {
         branch=$(_ou_branch)
         if [ -z "$branch" ]; then
             echo "${C_ERR}❌ The edit log is per-branch, but HEAD is detached.${C_RESET}"
-            echo "   Use the navigation log instead (e.g. 'git oplog --navigation')."
+            echo "   Use the navigation log instead (e.g. 'git undo --log --navigation')."
             return 1
         fi
         d=$(_ou_local_dir)            || return 1
@@ -1740,35 +1689,13 @@ _ou_show() {
     fi
 }
 
-git-undo-log() {
-    local compact interactive=0 mode=""
-    compact=$(_ou_cfg_oplog_compact)        # default view from undoredo.oplog; -c/-f override
-    local _ua; mapfile -t _ua < <(_ou_unbundle "$@"); set -- ${_ua[@]+"${_ua[@]}"}
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -h|--help)        _ou_help_oplog; return 0 ;;
-            --reset)          _ou_reset; return $? ;;
-            -c|--compact)     compact=1 ;;
-            -f|--full)        compact=0 ;;
-            -n|--navigation)  mode=navigation ;;
-            -e|--edit)        mode=edit ;;
-            -g|--global)      mode=global ;;
-            -i|--interactive) interactive=1 ;;
-            *) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_oplog >&2; return 2 ;;
-        esac
-        shift
-    done
-    _ou_require_repo || return 1
-    [ -z "$mode" ] && mode=$(_ou_cfg_default)   # neither flag: follow undoredo.default
-    _ou_show "$mode" "$compact" "$interactive"
-}
 
 # Reset the oplog: drop the tracked state (global timeline + cursor, all per-branch
 # logs, keep-refs) so the next command rebuilds it cleanly from git's reflog. This
 # is a REBUILD, not a wipe - re-deriving from the reflog is exactly how the tool is
 # meant to work, so recent history stitches back in; what's dropped is accumulated
 # tracking older than the reflog, prime anchors, and any wedged state. Does NOT touch
-# your commits or working tree. Exposed as `git oplog --reset`.
+# your commits or working tree. Exposed as `git undo --reset` (and `git redo --reset`).
 _ou_reset() {
     _ou_require_repo || return 1
     local sdir r had=0
@@ -1790,26 +1717,36 @@ _ou_reset() {
     echo "      and its gc protection is dropped - git's reflog keeps it until expiry.${C_RESET}"
 }
 
+# Point users of the old standalone commands at their new flag homes. The oplog and
+# opstatus commands were folded into undo/redo as --log and --status; this fires only
+# for a lingering old symlink or the umbrella form, since the installer no longer makes
+# git-oplog / git-opstatus.
+_ou_moved_hint() {
+    case "$1" in
+        *oplog)    echo "${C_DIM}'$1' is now${C_RESET} git undo --log ${C_DIM}(add -e/-n to scope, -i to pick).${C_RESET}" >&2 ;;
+        *opstatus) echo "${C_DIM}'$1' is now${C_RESET} git undo --status ${C_DIM}(add -e/-n to scope).${C_RESET}" >&2 ;;
+    esac
+    return 2
+}
+
 # ---- CLI dispatcher: runs only when executed, not when sourced -------
-# Multi-call binary: symlink (or copy) this file to git-undo, git-redo,
-# git-oplog, git-opstatus on your PATH; each dispatches by its invoked name.
-# The umbrella name (git-undo-redo) also takes the command as its first arg.
+# Multi-call binary: symlink (or copy) this file to git-undo, git-redo, git-take on
+# your PATH; each dispatches by its invoked name. The umbrella name (git-undo-redo)
+# also takes the command as its first arg.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     _ou_load_config     # one git-config read for all undoredo.* keys
     _ou_colors          # set up ANSI colors once (no-op when piped / disabled)
     case "$(basename "$0")" in
-        git-undo)     git-undo     "$@" ;;
-        git-redo)     git-redo     "$@" ;;
-        git-oplog)    git-undo-log "$@" ;;
-        git-opstatus) git-undo-status "$@" ;;
-        git-take)     git-take     "$@" ;;
+        git-undo)               git-undo "$@" ;;
+        git-redo)               git-redo "$@" ;;
+        git-take)               git-take "$@" ;;
+        git-oplog|git-opstatus) _ou_moved_hint "$(basename "$0")" ;;   # removed: see hint
         *)
             case "${1:-help}" in
-                undo)           shift; git-undo        "$@" ;;
-                redo)           shift; git-redo        "$@" ;;
-                oplog)          shift; git-undo-log    "$@" ;;
-                opstatus)       shift; git-undo-status "$@" ;;
-                take)           shift; git-take        "$@" ;;
+                undo)           shift; git-undo "$@" ;;
+                redo)           shift; git-redo "$@" ;;
+                take)           shift; git-take "$@" ;;
+                oplog|opstatus) _ou_moved_hint "git $1" ;;             # removed: see hint
                 reset|--reset)  _ou_reset ;;
                 help|-h|--help) _ou_usage ;;
                 *)              echo "${C_ERR}Unknown command: $1${C_RESET}" >&2; echo >&2; _ou_usage >&2; exit 2 ;;

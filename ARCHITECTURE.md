@@ -22,7 +22,7 @@ The **global** view (`-g`/`--global`) is a *third, derived* view: it merges the 
 durable logs by those timestamps into one chronological throughline and walks it,
 dispatching each step to its own axis - composed live at query time, never a third
 stored log. **Global is the default scope** for a bare command; `git config
-undoredo.default` (global|edit|navigation; default global) changes it.
+undoredo.scope` (global|edit|navigation; default global) changes it.
 
 ## The model
 
@@ -47,8 +47,8 @@ undoredo.default` (global|edit|navigation; default global) changes it.
   edit floors - and keeping prime anchors), then **walks** it, dispatching each step to
   an edit reset or a nav checkout. Because it reads the durable logs, not the reflog, it
   survives reflog expiry. The only stored global state is a cursor index
-  (`global/cursor`); the throughline itself is rebuilt on every command, so `git oplog
-  -g` and `git opstatus -g` always agree. Rows sort by `(ts, src, seq)` - ts the durable
+  (`global/cursor`); the throughline itself is rebuilt on every command, so `git undo
+  --log -g` and `git undo --status -g` always agree. Rows sort by `(ts, src, seq)` - ts the durable
   event time, then the source log, then the entry's index WITHIN that log - so for
   same-second entries each log's own order is preserved verbatim (the reflog is not
   consulted at all). `undo -g N` WALKS (each step may belong to a different axis) - the
@@ -100,18 +100,18 @@ undoredo.default` (global|edit|navigation; default global) changes it.
   forward. A commit on a detached HEAD belongs to no branch's edit log (the
   detached-commit seam). Both stay safe in git's reflog. These are the *only* gaps,
   and they fall out cleanly from "everything derives from the HEAD reflog."
-- **Unbounded retention.** Logs accumulate (rebuilt only by `git oplog --reset`). Safe
+- **Unbounded retention.** Logs accumulate (rebuilt only by `git undo --reset`). Safe
   - see Performance.
 
 ## Configuration
 
 Four `git config` keys (read at runtime; per-invocation flags always override):
 
-- `undoredo.default` = `global` | `edit` | `navigation` (default `global`) - the scope of
-  a bare `git undo` / `git redo` / `git oplog` / `git opstatus` (each also takes
+- `undoredo.scope` = `global` | `edit` | `navigation` (default `global`) - the scope of
+  a bare `git undo` / `git redo` and their `--status`/`--log` views (each also takes
   `-g`/`--global`, `-e`/`--edit`, and `-n`/`--navigation`).
-- `undoredo.oplog` = `full` | `compact` (default `full`) - the default `git oplog`
-  view (`-c`/`-f` override).
+- `undoredo.log` = `full` | `compact` (default `full`) - the default `git undo --log`
+  density (`-c`/`-f` override).
 - `undoredo.take` = `unstaged` | `staged` (default `unstaged`) - whether `git take`
   leaves its changes in the working tree (default) or staged (`-u`/`-s` override).
 - `undoredo.color` = `auto` | `always` | `never` (default `auto`) - colored output.
@@ -214,11 +214,11 @@ that undo/redo inherently produce (and which we strip back out on seed).
   `undoredo.take=staged`) also writes the index. Clean tree + a non-detached HEAD
   required. The removed `git undo --staged` flow is now just `git undo` then `git take`.
 - **oplog / picker** (`_ou_show` → `_ou_oplog_print` / `_ou_oplog_interactive`): render
-  the chosen log - `-e` edit / `-n` navigation (default `undoredo.default`). The printer
+  the chosen log - `-e` edit / `-n` navigation (default `undoredo.scope`). The printer
   reads a generic `TL_*` buffer that `_ou_show` copies the chosen log into. `-c` hides
   primes; `-i` is a picker (cursor move, no new op): an edit pick resets the branch and
   saves the edit cursor, a nav pick is one atomic checkout.
-- **reset** (`_ou_reset`, `git oplog --reset`): delete the nav + per-branch logs and
+- **reset** (`_ou_reset`, `git undo --reset`): delete the nav + per-branch logs and
   keep-refs; the next command re-seeds from the live reflog. A rebuild, not a wipe
   (re-deriving from the reflog *is* the model).
 - Both seeds anchor their cursor on the *actual* HEAD/branch tip (not just the
@@ -263,7 +263,7 @@ that undo/redo inherently produce (and which we strip back out on seed).
   the HEAD reflog directly - simpler, but it vanishes the moment git expires the reflog,
   even though the same operations still live in our durable oplogs. Merging the oplogs
   instead makes the global view as durable as undo/redo. Only a cursor index is stored
-  (`global/cursor`); the throughline is rebuilt each call (so oplog and opstatus agree).
+  (`global/cursor`); the throughline is rebuilt each call (so `--log` and `--status` agree).
   Rows sort by `(ts, src, seq)`: ts (the durable event time), then the source log, then
   the entry's index WITHIN that log. The `seq` key is load-bearing - WITHIN a source it
   ALWAYS decides same-second order, so a single branch's history is whatever its own log
@@ -349,7 +349,7 @@ that undo/redo inherently produce (and which we strip back out on seed).
   mislabeled `commit`, by classifying the reflog top. The detached-commit seam and
   off-branch tip-moves are the only between-run things still outside the model (both safe
   in git's reflog) - and they're inherent boundaries, not sampling gaps.
-- **`--reset` rebuilds, it doesn't wipe.** `git oplog --reset` drops the tracked
+- **`--reset` rebuilds, it doesn't wipe.** `git undo --reset` drops the tracked
   state so the next command re-seeds from the reflog - re-deriving is the whole model,
   so a one-entry "anchor at HEAD" would amputate the stitching and lose history before
   the reset. (Was named `--clear`, which wrongly implied a permanent wipe.) Long-flag
@@ -383,9 +383,9 @@ that undo/redo inherently produce (and which we strip back out on seed).
 
 - **git's own commands are unaffected** - `git status` was identical with and
   without our refs (they're not on git's hot path; keep-refs get packed by gc).
-- **undo / redo / opstatus are ~constant** regardless of oplog size (their cost is
+- **undo / redo / `--status` are ~constant** regardless of oplog size (their cost is
   fixed git-subprocess overhead, not oplog length).
-- **`git oplog` is ~constant** after batching subject lookups into ~one `git log`
+- **`git undo --log` is ~constant** after batching subject lookups into ~one `git log`
   per 256 entries (was O(n) subprocesses - 13s at 250 entries, now ~0.5s).
 - **Disk is trivial** - ~tens of bytes per oplog entry; the only variable object
   cost is *abandoned* states pinned by keep-refs (bounded by what you discard).
@@ -396,9 +396,9 @@ that undo/redo inherently produce (and which we strip back out on seed).
 
 - It's one bash script ([`git-undo-redo`](git-undo-redo)), a **multi-call binary**:
   it dispatches on `basename "$0"`. Install symlinks/copies it to `git-undo`,
-  `git-redo`, `git-oplog`, `git-opstatus`, `git-take`. The umbrella `git-undo-redo
-  <cmd>` form is for development.
-- **Test** by copying the script to those five names on `PATH`, then driving it in
+  `git-redo`, `git-take` (log/status are `git undo --log`/`--status` flags now). The
+  umbrella `git-undo-redo <cmd>` form is for development.
+- **Test** by copying the script to those three names on `PATH`, then driving it in
   throwaway repos (`git init` in `mktemp -d`). Interactive paths (`-i`) need a TTY;
   verify their logic by exercising the helpers directly when no pty is available.
 - **Keep the surfaces in sync** when changing the command/flag surface: the script

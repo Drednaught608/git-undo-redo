@@ -63,8 +63,8 @@ cd git-undo-redo
 ./install.sh --bin ~/bin     # ...or a directory of your choice
 ```
 
-The installer drops five commands (`git-undo`, `git-redo`, `git-oplog`,
-`git-opstatus`, `git-take`) into the target directory. If that directory isn't on your
+The installer drops three commands (`git-undo`, `git-redo`, `git-take`) into the
+target directory. If that directory isn't on your
 `PATH` yet, it offers to add the line to your shell's rc file (`~/.bashrc` or
 `~/.zshrc`) for you; decline and it just prints the command to run yourself.
 
@@ -92,25 +92,24 @@ the history browser, status - is optional power, summarized here and explained u
 | `git redo` / `-e` / `-n` / `-g` | Re-apply your last operation across both axes (`-g`, default), an edit (`-e`), or a branch switch (`-n`) that you undid. |
 | `git take` | Copy the branch's **latest** edit (the top of the edit log) into your files **without moving** `HEAD` - the common flow is `git undo` to look back, then `git take` to pull your newest work in. Lands unstaged by default. Edit-based (reads the current branch's log); needs a clean tree and a branch. |
 | `git take N` | Reach the commit `N` entries above your current point (so `git take 1` is the closest one above you, `git take 2` further up). Applies that commit's full tree wholesale. Refuses, changing nothing, if there are fewer than `N` commits above you. |
-| `git undo -i` / `git redo -i` | Open the picker for the chosen scope (global by default, `-e` for edit, `-n` for navigation) and drop straight to a point you choose (press `t` to toggle resume points). Same screen as `git oplog -i`. |
-| `git oplog` | Show the composed **global log**, newest first, with `@` marking where you are. `-e`/`--edit` shows the current branch's **edit log**, `-n`/`--navigation` the **navigation log**. (`-c`/`--compact` hides resume points (↻); `-f`/`--full` is the default.) |
-| `git oplog --interactive` | Show the log (edit, navigation, or global via `-e`/`-n`/`-g`) and drop straight to a point you pick (`-i`; `-c`/`-f` set the initial view, `t` toggles it in-screen). A cursor move; for navigation it's a single atomic checkout. |
-| `git oplog --reset` | Drop the tracked logs (navigation + per-branch edit logs) so they rebuild cleanly from git's reflog on the next command (a rebuild, not a wipe - recent history stitches back; accumulated tracking older than the reflog, resume points, and any wedged state are dropped). Your commits and files are untouched. |
-| `git opstatus` | Show the current `HEAD` and how many undo / redo steps remain, globally across both axes (default), for the current branch's edits (`-e`/`--edit`), or the navigation log (`-n`/`--navigation`). |
+| `git undo --status` / `-s` | Show the current `HEAD` and how many undo / redo steps remain, globally across both axes (default), for the current branch's edits (`-e`), or the navigation log (`-n`). Read-only; `git redo --status` shows the same thing. |
+| `git undo --log` / `-l` | Show the composed **global log**, newest first, with `@` marking where you are. `-e`/`--edit` shows the current branch's **edit log**, `-n`/`--navigation` the **navigation log**. (`-c`/`--compact` hides resume points (↻); `-f`/`--full` is the default.) Read-only. |
+| `git undo -i` / `--interactive` | Show that log (edit, navigation, or global via `-e`/`-n`/`-g`) as a picker and drop straight to a point you choose (`-c`/`-f` set the initial density, `t` toggles it in-screen). A cursor move; for navigation it's a single atomic checkout. |
+| `git undo --reset` | Drop the tracked logs (navigation + per-branch edit logs) so they rebuild cleanly from git's reflog on the next command (a rebuild, not a wipe - recent history stitches back; accumulated tracking older than the reflog, resume points, and any wedged state are dropped). Your commits and files are untouched. Long form only. |
 
-`git config undoredo.default` (`global`, the default, or `edit` / `navigation`) governs the scope of a bare `git undo` / `git redo` / `git oplog` / `git opstatus`. `git config undoredo.oplog` (`full`, the default, or `compact`) sets the default `git oplog` view. `git config undoredo.take` (`unstaged`, the default, or `staged`) sets where `git take` lands the changes. `git config undoredo.color` (`auto`, the default, or `always` / `never`) controls colored output: `auto` colors only when writing to a terminal (and honors `NO_COLOR`), so piped output stays plain. Short flags can be bundled - `git oplog -nc` is `git oplog -n -c`, and so on (a count stays separate: `git undo -e 3`, not `-e3`).
-Flags always override the config. Every command takes `-h` for help - use `-h`, not
+Behavior is configurable via `git config` - the scope of a bare command, the `--log` density, where `git take` lands, and color. See **[Configuration](#configuration)** below; flags always override the config. Short flags can be bundled - `git undo -nl` is `git undo -n -l`, and so on (a count stays separate: `git undo -e 3`, not `-e3`).
+Every command takes `-h` for help - use `-h`, not
 `--help`, after `git undo`: git itself reserves `git <cmd> --help` for a manual-page
 lookup (it never reaches this tool), so `git undo --help` reports "documentation file
 not found" rather than showing help. (`-h` is passed straight through, and the binaries
 also accept `--help` directly, e.g. `git-undo --help`.)
 
 ```console
-$ git opstatus
+$ git undo --status
 HEAD is at: a1b2c3d Add login form
 Available globally (all operations, in order) (undo: 4 · redo: 1)
 
-$ git oplog
+$ git undo --log
 Global operation log (newest first; @ = current position):
      5  commit    main (at e4f5a6b Wire up validation)
  @   4  commit    main (at a1b2c3d Add login form)
@@ -118,6 +117,32 @@ Global operation log (newest first; @ = current position):
      2  checkout  feature (at edf1cd2 Scaffold routes)
      1  commit    main (at 1b2c3d4 Initial parser)
      0  commit    main (at 0a1b2c3 Project skeleton)
+```
+
+## Configuration
+
+Everything is optional - the defaults are what you get out of the box. Set a key per
+repo with `git config`, or everywhere with `git config --global`; a per-command flag
+always overrides the config for that run.
+
+Here is the full `[undoredo]` section as it would appear in your `~/.gitconfig`. Each
+value shown **is the default**; the comment lists the choices, so you can copy the block
+and edit a value in place:
+
+```ini
+[undoredo]
+    scope = global      # global | edit | navigation   - scope of a bare undo/redo (and --status / --log)
+    log   = full        # full | compact               - density of `git undo --log`
+    take  = unstaged    # unstaged | staged            - where `git take` puts the changes
+    color = auto        # auto | always | never        - colored output (auto = only to a terminal)
+```
+
+Or set them one at a time from the shell:
+
+```bash
+git config undoredo.scope edit       # make a bare `git undo` default to this branch's edits
+git config undoredo.log   compact    # hide resume points in `git undo --log`
+git config --global undoredo.take staged   # everywhere: `git take` stages by default
 ```
 
 ## Keeping changes with `git take`
@@ -183,7 +208,7 @@ back on `feature` in one checkout:
 $ git undo -n
 ↶ Undo (checkout) → on feature  (undo: 6 · redo: 1)
 
-$ git oplog -n
+$ git undo --log -n
 Navigation log (newest first; @ = current position):
  @   3  checkout  feature (at 1f3a9c2 Add parser tests)
      2  checkout  main (at a1b2c3d Add login form)
@@ -199,7 +224,7 @@ composed log shows both axes in one timeline:
 $ git undo
 ↶ Undo → 40778a3 Initial parser on main  (undo: 4 · redo: 1)
 
-$ git oplog -g
+$ git undo --log -g
 Global operation log (newest first; @ = current position):
      5  commit    main (at 40778a3 Initial parser)
  @   4  checkout  main (at 40778a3 Initial parser)
@@ -293,8 +318,8 @@ contributors.
   for history others already have.)
 - **History grows with use.** On first use the oplog is seeded from your recent
   reflog; after that every operation is appended, so it accumulates the full
-  history of what you've done - rebuilt only by `git oplog --reset`.
-- **`git oplog --reset`** drops the tracked oplog and its gc protections so the next
+  history of what you've done - rebuilt only by `git undo --reset`.
+- **`git undo --reset`** drops the tracked oplog and its gc protections so the next
   command rebuilds it cleanly from git's reflog. It's a *rebuild*, not a wipe: the
   reflog is exactly what the tool seeds from, so your recent history stitches back in
   - what's dropped is accumulated tracking older than the reflog, resume points, and
@@ -329,13 +354,17 @@ straight from the reflog by the navigation log.)
 
 ```bash
 ./install.sh --uninstall            # from a clone
-# or, if you don't have the repo handy:
-rm -f ~/.local/bin/git-{undo,redo,oplog,opstatus,take}
+# or the same remote link, no clone needed:
+curl -fsSL https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/install.sh | bash -s -- --uninstall
 ```
+
+The `bash -s -- --uninstall` form passes the flag through to the piped script. Either
+way it removes the commands from wherever they are on your `PATH` (and the default
+directory), so no clone is required.
 
 This removes only the commands. Each repo's undo/redo tracking lives in its own
 `.git/git-undo-redo/` and is left alone; delete that directory (`rm -rf
-.git/git-undo-redo`) to remove it from a repo, or `git oplog --reset` to rebuild
+.git/git-undo-redo`) to remove it from a repo, or `git undo --reset` to rebuild
 it fresh from the reflog.
 
 ## License
