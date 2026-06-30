@@ -10,13 +10,14 @@
 # kinds of "undo", and this tool keeps an append-only log for each, with a third
 # view that composes them in time order:
 #
-#   * EDIT (`git undo`, the default): step back one edit on the current branch (commit,
-#          reset, merge, rebase, amend) - one reset of that branch.
-#   * GLOBAL (`git undo -g`): step back your single most recent operation across BOTH
-#          axes, in chronological order. `undo -g N` WALKS N steps (dispatching each to
+#   * EDIT (`git undo` / `git redo`, the default): step back one edit on the current branch
+#          (commit, reset, merge, rebase, amend) - one reset of that branch.
+#   * NAV  (`git back` / `git forward`, their own commands): step back one navigation - a
+#          branch switch / checkout - one atomic checkout back to where you were. Separate
+#          from undo/redo so they never yank your branch.
+#   * GLOBAL (`git undo -g`, advanced): step back your single most recent operation across
+#          BOTH axes, in chronological order. `undo -g N` WALKS N steps (dispatching each to
 #          its own axis); composed live, never stored as a third log.
-#   * NAV  (`git undo -n`): step back one navigation - a branch switch / checkout
-#          - one atomic checkout back to where you were.
 #
 # Both per-axis logs are seeded/refreshed from git's HEAD reflog (the durable record
 # of every HEAD move), filtered two ways: nav keeps the checkout moves; each branch's
@@ -42,7 +43,7 @@
 # -----
 #   * seed : on first use each log is stitched from the HEAD reflog, our own hops
 #            stripped. So even cold, `git undo` reverses your last edit and
-#            `git undo -n` your last switch.
+#            `git back` your last switch.
 #   * undo/redo : a single atomic restore - one reset (edit) or one checkout (nav).
 #            `undo N` is a direct jump, not a walk; `undo -g N` is the one exception
 #            (it walks, since each step may belong to a different axis).
@@ -162,7 +163,8 @@ _ou_local_dir_for() { local e="$1"; e="${e//%/%25}"; e="${e////%2F}"; printf '%s
 # User preferences, read once per run by _ou_load_config in a SINGLE git call for
 # all undoredo.* keys (per-process cache, so a `git config` change is picked up on
 # the next command - nothing is persisted). Flag overrides are applied by callers.
-#   undoredo.scope = edit | global | navigation (default edit) - bare undo/redo scope
+#   undoredo.scope = edit | global (default edit) - bare undo/redo scope (navigation is
+#                    its own commands now: `git back` / `git forward`)
 #   undoredo.log   = full   | compact (default full)   - default 'git undo --log' density
 #   undoredo.color   = auto   | always | never (default auto, color to a TTY)
 #   undoredo.take    = unstaged | staged (default unstaged) - whether git take stages
@@ -178,7 +180,7 @@ _ou_load_config() {
         esac
     done < <(git config --get-regexp '^undoredo\.' 2>/dev/null)   # last value wins, like --get
 }
-_ou_cfg_scope()       { case "$OU_CFG_SCOPE" in global) printf 'global' ;; navigation|nav) printf 'navigation' ;; *) printf 'edit' ;; esac; }
+_ou_cfg_scope()       { case "$OU_CFG_SCOPE" in global) printf 'global' ;; *) printf 'edit' ;; esac; }
 _ou_cfg_log_compact() { case "$OU_CFG_LOG"   in compact) printf '1' ;;   *) printf '0' ;;      esac; }
 _ou_cfg_take()          { case "$OU_CFG_TAKE"    in staged) printf 'staged' ;; *) printf 'unstaged' ;; esac; }
 
@@ -471,7 +473,7 @@ _ou_nav_goto() {
 
 _ou_nav_meter() {
     local last=$(( ${#NV_SHA[@]} - 1 ))
-    printf '%s(undo: %d · redo: %d)%s' "$C_DIM" "$NCUR" "$(( last - NCUR ))" "$C_RESET"
+    printf '%s(back: %d · forward: %d)%s' "$C_DIM" "$NCUR" "$(( last - NCUR ))" "$C_RESET"
 }
 
 # Describe a nav position: "<branch>" or "detached <short-sha>".
@@ -480,50 +482,54 @@ _ou_nav_where() {
     if [ -n "$ref" ]; then printf '%s' "$ref"; else printf 'detached %s' "${sha:0:7}"; fi
 }
 
-# `git undo -n [N]`: step back N navigation moves (default 1) - ONE atomic checkout
-# to the target position, never a walk. Refuses, changing nothing, if N is too many.
+# `git back [N]`: step back N navigation moves (default 1) - ONE atomic checkout to the
+# target position, never a walk. Refuses, changing nothing, if N is too many. The
+# navigation analog of `git undo`, but its own command so undo/redo never yank your branch.
 _ou_undo_nav() {
     local count="${1:-1}" avail
     _ou_nav_sync      || return 1
     avail=$NCUR
+    [ "$count" = all ] && count=$avail              # 'all' -> as far back as the nav log goes
     if [ "$avail" -le 0 ]; then
-        echo "${C_ERR}🛑 Nothing to undo: already at the oldest recorded position.${C_RESET}"
-        return 1   # asked to undo, nothing moved: a no-op exits non-zero (like "too many")
+        echo "${C_ERR}🛑 Nothing to go back to: already at the oldest recorded position.${C_RESET}"
+        return 1   # asked to move, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
-        echo "${C_ERR}🛑 Only $(_ou_qty "$avail" move) available to undo; you asked for $count. Nothing changed.${C_RESET}"
+        echo "${C_ERR}🛑 Only $(_ou_qty "$avail" move) back; you asked for $count. Nothing changed.${C_RESET}"
         return 1
     fi
     _ou_wip_before || return 1
     _ou_nav_goto $(( NCUR - count )) git-undo || { _ou_restore_failed; _ou_wip_after; return 1; }
     if [ "$count" -eq 1 ]; then
-        echo "${C_UNDO}↶ Undo (checkout) →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
+        echo "${C_UNDO}↶ Back →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
     else
-        echo "${C_UNDO}↶ Undo $count navigations →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
+        echo "${C_UNDO}↶ Back $count →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
     fi
     _ou_wip_after
 }
 
-# `git redo -n [N]`: step forward N navigation moves (default 1), atomic.
+# `git forward [N]`: step forward N navigation moves (default 1), atomic. The redo analog
+# for branch navigation.
 _ou_redo_nav() {
     local count="${1:-1}" last avail
     _ou_nav_sync      || return 1
     last=$(( ${#NV_SHA[@]} - 1 ))
     avail=$(( last - NCUR ))
+    [ "$count" = all ] && count=$avail              # 'all' -> forward to the most recent position
     if [ "$avail" -le 0 ]; then
-        echo "${C_ERR}🛑 Nothing to redo: already at the most recent position.${C_RESET}"
-        return 1   # asked to redo, nothing moved: a no-op exits non-zero (like "too many")
+        echo "${C_ERR}🛑 Nothing to go forward to: already at the most recent position.${C_RESET}"
+        return 1   # asked to move, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
-        echo "${C_ERR}🛑 Only $(_ou_qty "$avail" move) available to redo; you asked for $count. Nothing changed.${C_RESET}"
+        echo "${C_ERR}🛑 Only $(_ou_qty "$avail" move) forward; you asked for $count. Nothing changed.${C_RESET}"
         return 1
     fi
     _ou_wip_before || return 1
     _ou_nav_goto $(( NCUR + count )) git-redo || { _ou_restore_failed; _ou_wip_after; return 1; }
     if [ "$count" -eq 1 ]; then
-        echo "${C_REDO}↷ Redo (checkout) →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
+        echo "${C_REDO}↷ Forward →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
     else
-        echo "${C_REDO}↷ Redo $count navigations →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
+        echo "${C_REDO}↷ Forward $count →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
     fi
     _ou_wip_after
 }
@@ -799,6 +805,7 @@ _ou_undo_global() {
     local count="${1:-1}" avail
     _ou_global_derive   || { echo "${C_DIM}No history to undo yet.${C_RESET}"; return 1; }
     avail=$GCUR
+    [ "$count" = all ] && count=$avail              # 'all' -> as far back as the merged log goes
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to undo: already at the oldest recorded state.${C_RESET}"; _ou_root_uncommit_hint "${GL_KIND[0]:-}"; return 1
     fi
@@ -817,6 +824,7 @@ _ou_redo_global() {
     local count="${1:-1}" last avail
     _ou_global_derive   || { echo "${C_DIM}No history to redo yet.${C_RESET}"; return 1; }
     last=$(( ${#GL_SHA[@]} - 1 )); avail=$(( last - GCUR ))
+    [ "$count" = all ] && count=$avail              # 'all' -> forward to the most recent state
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to redo: already at the most recent state.${C_RESET}"; return 1
     fi
@@ -1132,12 +1140,13 @@ _ou_undo_local() {
     branch="$(_ou_branch)"
     if [ -z "$branch" ]; then
         echo "${C_ERR}❌ Edit undo needs a branch, but HEAD is detached.${C_RESET}"
-        echo "   Run 'git undo --navigation' to undo your last position change instead."
+        echo "   Run 'git back' to step back through your branch switches / checkouts instead."
         return 1
     fi
     d=$(_ou_local_dir)            || return 1
     _ou_local_sync "$d" "$branch" || return 1
     avail=$LCUR
+    [ "$count" = all ] && count=$avail              # 'all' -> as far back as the log goes
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to undo on branch $branch: already at its oldest edit.${C_RESET}"
         _ou_root_uncommit_hint "${LT_KIND[0]:-}"
@@ -1162,14 +1171,15 @@ _ou_redo_local() {
     local count="${1:-1}" d branch last avail
     branch="$(_ou_branch)"
     if [ -z "$branch" ]; then
-        echo "${C_ERR}❌ Local redo needs a branch, but HEAD is detached.${C_RESET}"
-        echo "   Run 'git redo --navigation' to redo your last position change instead."
+        echo "${C_ERR}❌ Edit redo needs a branch, but HEAD is detached.${C_RESET}"
+        echo "   Run 'git forward' to step forward through your branch switches instead."
         return 1
     fi
     d=$(_ou_local_dir)            || return 1
     _ou_local_sync "$d" "$branch" || return 1
     last=$(( ${#LT_SHA[@]} - 1 ))
     avail=$(( last - LCUR ))
+    [ "$count" = all ] && count=$avail              # 'all' -> forward to the most recent edit
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to redo on branch $branch: already at its most recent edit.${C_RESET}"
         return 1   # asked to redo, nothing moved: a no-op exits non-zero (like "too many")
@@ -1264,12 +1274,12 @@ _ou_usage() {
     cat <<'EOF'
 git undo/redo - undo and redo for git, like Ctrl+Z / Ctrl+Y. Reads git's own history.
 
-Commands (installed as git-undo, git-redo, git-take, git-goto on PATH):
-  git undo        Step back your most recent edit on the current branch (-g across both
-                  edits and branch switches in time order, -n for just a branch switch).
-                  Add --status to see where you are, --log to list the history, or -i to
-                  pick a point to jump to.
-  git redo        Re-apply the operation you last undid (same flags as git undo).
+Commands (installed as git-undo, git-redo, git-take, git-goto, git-back, git-forward):
+  git undo        Step back your most recent edit on the current branch. Add --status to
+                  see where you are, --log to list the history, or -i to pick a point.
+  git redo        Re-apply the edit you last undid (same flags as git undo).
+  git back        Step back through your branch switches (navigation undo) - 'git back N'
+  git forward     and 'git forward' go the other way. The official way to undo a checkout.
   git take        Copy a commit's changes into your files without moving HEAD - e.g.
                   'git undo' to look back, then 'git take' to pull your latest work in.
   git goto        Switch branches like 'git switch' without committing or stashing first -
@@ -1280,17 +1290,16 @@ Run any command with -h for details. (git reserves '--help' for its own manual p
 so `git undo --help` looks for a man page, not this text - use -h here.)
 
 Notes:
-  * Undo/redo handle your uncommitted work automatically: it's parked as you move (it
-    leaves the working tree) and restored when you come back - so there's no need to
-    commit or stash first, and a change that vanishes on undo returns on redo.
-  * `git undo N` / `git redo N` do N at once; they refuse (changing nothing) if N
+  * undo/redo and back/forward handle your uncommitted work automatically: it's parked as
+    you move (it leaves the working tree) and restored when you come back - so there's no
+    need to commit or stash first, and a change that vanishes on undo returns on redo.
+  * `git undo N` / `git back N` etc. do N at once; they refuse (changing nothing) if N
     is more than available, and tell you how many there are.
   * Undoing then acting never loses history - the old work is still there to redo.
-  * By default undo/redo act on this branch's edits; -g covers everything you've done
-    (commits and branch switches) in order, -n just branch switches. Set defaults with
-    `git config undoredo.scope` (edit|global|navigation), the log density with
-    `undoredo.log` (full|compact), whether `git take` stages with `undoredo.take`
-    (unstaged|staged), and color with `undoredo.color` (auto|always|never).
+  * undo/redo act on this branch's edits; -g (advanced) covers edits AND branch switches in
+    time order. Set the default with `git config undoredo.scope` (edit|global), the log
+    density with `undoredo.log` (full|compact), whether `git take` stages with
+    `undoredo.take` (unstaged|staged), and color with `undoredo.color` (auto|always|never).
 EOF
 }
 
@@ -1298,7 +1307,7 @@ _ou_help_undo() {
     cat <<'EOF'
 git undo - step back your most recent change, like Ctrl+Z for git.
 
-Usage: git undo [N] [-s | -l | -i] [-c | -f] [-w]
+Usage: git undo [N | all] [-s | -l | -i] [-c | -f] [-w]
 
 Reverses your last change - a commit, an amend, even a bad 'git reset --hard' - and your
 files follow. 'git redo' re-applies it; 'git take' keeps an undone commit's changes so
@@ -1306,7 +1315,7 @@ you can re-edit. Any uncommitted work is parked as you move (it leaves the worki
 and restored when you return, so you needn't stash first - a change that disappears on
 undo comes back on redo.
 
-  N                 Undo N at once (e.g. 'git undo 3'); refuses if more than exist.
+  N | all           Undo N at once (e.g. 'git undo 3'), or 'all' to the oldest; refuses if over.
   -s, --status      Show where you are and how many undo/redo steps remain.
   -l, --log         Show the log of what you've done (newest first; '@' = where you are).
   -i, --interactive Browse that log and jump to a point you pick ('t' toggles detail).
@@ -1314,8 +1323,8 @@ undo comes back on redo.
   -w, --worktree    Step back through saved versions of your uncommitted work for THIS
                     commit (parked by 'git goto' or a dirty undo) - without moving HEAD.
                     'git redo --worktree' steps forward; add -l/-s/-i to list or pick.
-  -h                Show this help. '-h -a' adds scopes (-e/-n/-g) and --reset.
-                    (git reserves --help; use -h, or 'git-undo --help' directly.)
+  -h                Show this help. '-h -a' adds -e/-g and --reset.
+                    (For branch navigation, see 'git back' / 'git forward'.)
 EOF
 }
 
@@ -1323,21 +1332,13 @@ _ou_help_undo_full() {
     cat <<'EOF'
 git undo - step back your most recent operation, or look at the history without moving.
 
-Usage: git undo [N] [-e | -n | -g] [-s | -l | -i] [-c | -f] [-h]
+Usage: git undo [N | all] [-s | -l | -i] [-c | -f] [-e | -g] [-w] [-h]
 
 By default it reverses your last edit on the current branch (commit, reset, merge,
 rebase, amend) and tells you where you land. Pass a number to step back several at once
 (e.g. 'git undo 3'); if that is more than exist, it refuses and says how many there are.
 Uncommitted work is parked as you move (it leaves the working tree) and restored when you
 return - so no need to commit or stash first; a change that vanishes on undo returns on redo.
-
-Scope - applies to the action AND the views below; with none, follows
-'git config undoredo.scope' (default edit):
-  -e, --edit        Just this branch's edits (commit, reset, merge, rebase, amend).
-                    The DEFAULT.
-  -n, --navigation  Just branch switches / checkouts.
-  -g, --global      Everything, in order. A step can land you on another branch;
-                    'git undo -g 3' undoes the last three across both axes.
 
 Look instead of move (read-only; redo takes these too, showing the same thing):
   -s, --status      Show where you are and how many undo/redo steps remain.
@@ -1348,18 +1349,23 @@ Look instead of move (read-only; redo takes these too, showing the same thing):
   -f, --full        Show every entry in the log/picker; overrides config.
 
 Other:
-  N                 Undo N steps at once (default 1).
+  N | all           Undo N steps at once (default 1; 'all' = the oldest).
   -w, --worktree    Step through THIS commit's parked uncommitted-work versions (saved by
                     'git goto' or a dirty undo/redo) - undo = an older dirty state, redo
                     = a newer one. Restores the staged/unstaged split. After a plain
                     'git switch', the first 'git undo -w' loads your latest parked
                     version. Pair with --log/--status/-i to list, check, or pick one.
+  -e, --edit        This branch's edits only - the DEFAULT, stated explicitly. Applies to
+                    the action and the views; set the default with 'git config undoredo.scope'.
+  -g, --global      Undo across BOTH your edits and your branch switches, in time order - a
+                    step can land you on another branch ('git undo -g 3' undoes the last
+                    three). (For navigation ONLY, use 'git back'.)
       --reset       Rebuild the log from git's reflog (maintenance; long form only).
   -h                '-h' is the short help; '-h -a' (--advanced) is this full one.
                     (git reserves '--help'; use -h, or 'git-undo --help' directly.)
 
 To keep a commit's changes while undoing past it, undo as normal, then run 'git take'
-(see 'git take -h').
+(see 'git take -h'). For branch switches, see 'git back' / 'git forward'.
 EOF
 }
 
@@ -1367,13 +1373,13 @@ _ou_help_redo() {
     cat <<'EOF'
 git redo - re-apply the change you last undid, like Ctrl+Y for git.
 
-Usage: git redo [N] [-s | -l | -i] [-c | -f] [-w]
+Usage: git redo [N | all] [-s | -l | -i] [-c | -f] [-w]
 
 Re-applies what you just undid ('git redo 2' re-applies two). It stays available until
 you make a new change, so undoing is never a dead end. Uncommitted work is parked as you
 move and restored when you return - so a change that vanished on undo comes back here.
 
-  N                 Redo N at once (e.g. 'git redo 2'); refuses if more than were undone.
+  N | all           Redo N at once (e.g. 'git redo 2'), or 'all' to the newest; refuses if over.
   -s, --status      Show where you are and how many undo/redo steps remain.
   -l, --log         Show the log of what you've done (newest first; '@' = where you are).
   -i, --interactive Browse that log and jump to a point you pick ('t' toggles detail).
@@ -1381,8 +1387,8 @@ move and restored when you return - so a change that vanished on undo comes back
   -w, --worktree    Step forward through saved versions of your uncommitted work for THIS
                     commit (parked by 'git goto' or a dirty undo) - without moving HEAD.
                     'git undo --worktree' steps back; add -l/-s/-i to list or pick.
-  -h                Show this help. '-h -a' adds scopes (-e/-n/-g) and --reset.
-                    (git reserves --help; use -h, or 'git-redo --help' directly.)
+  -h                Show this help. '-h -a' adds -e/-g and --reset.
+                    (For branch navigation, see 'git back' / 'git forward'.)
 EOF
 }
 
@@ -1390,17 +1396,12 @@ _ou_help_redo_full() {
     cat <<'EOF'
 git redo - re-apply the operation you last undid, or look at the history without moving.
 
-Usage: git redo [N] [-e | -n | -g] [-s | -l | -i] [-c | -f] [-h]
+Usage: git redo [N | all] [-s | -l | -i] [-c | -f] [-e | -g] [-w] [-h]
 
 By default it re-applies your last undone edit on the current branch. Pass a number to
 redo several at once (e.g. 'git redo 2'); it refuses, changing nothing, if that is more
 than were undone. Redoing never discards anything, so it stays available until you make
 a new change. Uncommitted work is parked as you move and restored when you return.
-
-Scope (applies to the action and the views; default from 'git config undoredo.scope'):
-  -e, --edit        Just this branch's edits. The DEFAULT.
-  -n, --navigation  Just branch switches / checkouts.
-  -g, --global      Across everything, in time order.
 
 Look instead of move (read-only; identical to 'git undo's views):
   -s, --status      Where you are and how many undo/redo steps remain.
@@ -1410,12 +1411,15 @@ Look instead of move (read-only; identical to 'git undo's views):
   -c, --compact / -f, --full   Condense / expand the log and picker; override config.
 
 Other:
-  N                 Redo N steps at once (default 1).
+  N | all           Redo N steps at once (default 1; 'all' = the newest).
   -w, --worktree    Step through THIS commit's parked uncommitted-work versions (saved by
                     'git goto' or a dirty undo/redo) - redo = a newer dirty state, undo
                     = an older one. Restores the staged/unstaged split. After a plain
                     'git switch', the first 'git undo -w' loads your latest parked
                     version. Pair with --log/--status/-i to list, check, or pick one.
+  -e, --edit        This branch's edits only - the DEFAULT, stated explicitly.
+  -g, --global      Re-apply across BOTH edits and branch switches, in time order. (For
+                    navigation ONLY, use 'git forward'.)
       --reset       Rebuild the log from git's reflog (maintenance; long form only).
   -h                '-h' is the short help; '-h -a' (--advanced) is this full one.
                     (git reserves '--help'; use -h, or 'git-redo --help' directly.)
@@ -1437,6 +1441,45 @@ changes into your working tree to edit and re-commit. Bare take grabs your lates
   -u, --unstaged  Land changes in the working tree, unstaged (the default).
   -s, --staged    Land them staged, ready to commit.
   -h              Show this help. (Use -h, not --help, which git intercepts.)
+EOF
+}
+
+_ou_help_back() {
+    cat <<'EOF'
+git back - step back through your branch switches (navigation undo).
+
+Usage: git back [N | all] [-s | -l | -i] [-c | -f]
+
+Returns you to where you were BEFORE your last branch switch / checkout - one atomic
+checkout, not a walk. 'git forward' steps the other way. This is navigation only: your
+branch tips and edits are untouched (use 'git undo' for those). Uncommitted work is parked
+as you move and restored when you come back.
+
+  N | all           Go back N at once (e.g. 'git back 3'), or 'all' to the furthest; refuses if over.
+  -s, --status      Show where you are and how many back/forward steps remain.
+  -l, --log         Show the navigation log (newest first; '@' = where you are).
+  -i, --interactive Browse that log and jump straight to a point you pick.
+  -c, --compact     Condense the log/picker; -f, --full shows every entry.
+  -h                Show this help. (Use -h, not --help, which git intercepts.)
+EOF
+}
+
+_ou_help_forward() {
+    cat <<'EOF'
+git forward - step forward through your branch switches (navigation redo).
+
+Usage: git forward [N | all] [-s | -l | -i] [-c | -f]
+
+Re-does a branch switch you stepped back from with 'git back' - one atomic checkout. Stays
+available until you make a new switch. Navigation only; your branch tips and edits are
+untouched. Uncommitted work is parked as you move and restored when you come back.
+
+  N | all           Go forward N (e.g. 'git forward 2'), or 'all' to the furthest; refuses if over.
+  -s, --status      Show where you are and how many back/forward steps remain.
+  -l, --log         Show the navigation log (newest first; '@' = where you are).
+  -i, --interactive Browse that log and jump straight to a point you pick.
+  -c, --compact     Condense the log/picker; -f, --full shows every entry.
+  -h                Show this help. (Use -h, not --help, which git intercepts.)
 EOF
 }
 
@@ -1465,7 +1508,8 @@ _ou_unbundle() {
 }
 
 # Action by default; a view flag (--status/--log/--interactive) looks instead of moves.
-# All of them honor the scope flags (-g/-e/-n) and the undoredo.scope config.
+# Edit scope by default; -g/--global is the advanced cross-axis view. (Branch navigation
+# is its own command, `git back`.)
 git-undo() {
     local mode="" view="" count=1 compact wipnav=0
     compact=$(_ou_cfg_log_compact)        # default log density; -c/-f override
@@ -1479,7 +1523,6 @@ git-undo() {
         case "$1" in
             --reset)          _ou_reset; return $? ;;
             -e|--edit)        mode=edit ;;
-            -n|--navigation)  mode=navigation ;;
             -g|--global)      mode=global ;;
             -w|--worktree)    wipnav=1 ;;
             -s|--status)      case "$view" in ""|status)      view=status ;;      *) view=CONFLICT ;; esac ;;
@@ -1488,6 +1531,7 @@ git-undo() {
             -c|--compact)     compact=1 ;;
             -f|--full)        compact=0 ;;
             *)  case "$1" in
+                    [Aa][Ll][Ll]) count=all ;;          # 'all' = undo as far back as the log goes
                     ''|*[!0-9]*) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_undo >&2; return 2 ;;
                     *)           count=$((10#$1)) ;;     # bare number = how many to undo
                 esac ;;
@@ -1512,9 +1556,8 @@ git-undo() {
         interactive) _ou_show "$mode" "$compact" 1; return $? ;;
     esac
 
-    [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to undo (0 requested).${C_RESET}"; return 0; }
+    [ "$count" != all ] && [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to undo (0 requested).${C_RESET}"; return 0; }
     case "$mode" in
-        navigation) _ou_undo_nav "$count" ;;
         global)     _ou_undo_global "$count" ;;
         *)          _ou_undo_local "$count" ;;
     esac
@@ -1531,7 +1574,6 @@ git-redo() {
         case "$1" in
             --reset)          _ou_reset; return $? ;;
             -e|--edit)        mode=edit ;;
-            -n|--navigation)  mode=navigation ;;
             -g|--global)      mode=global ;;
             -w|--worktree)    wipnav=1 ;;
             -s|--status)      case "$view" in ""|status)      view=status ;;      *) view=CONFLICT ;; esac ;;
@@ -1540,6 +1582,7 @@ git-redo() {
             -c|--compact)     compact=1 ;;
             -f|--full)        compact=0 ;;
             *)  case "$1" in
+                    [Aa][Ll][Ll]) count=all ;;          # 'all' = redo forward to the most recent state
                     ''|*[!0-9]*) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_redo >&2; return 2 ;;
                     *)           count=$((10#$1)) ;;     # bare number = how many to redo
                 esac ;;
@@ -1564,12 +1607,51 @@ git-redo() {
         interactive) _ou_show "$mode" "$compact" 1; return $? ;;
     esac
 
-    [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to redo (0 requested).${C_RESET}"; return 0; }
+    [ "$count" != all ] && [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to redo (0 requested).${C_RESET}"; return 0; }
     case "$mode" in
-        navigation) _ou_redo_nav "$count" ;;
         global)     _ou_redo_global "$count" ;;
         *)          _ou_redo_local "$count" ;;
     esac
+}
+
+# `git back [N]` / `git forward [N]` - navigation undo/redo: step back / forward through
+# your branch switches & checkouts (the navigation log). The same atomic-checkout engine
+# the old `git undo -n` used, but their own commands so undo/redo never yank your branch.
+# They take the read-only views (-s/-l/-i) and density flags (-c/-f), nothing else - no
+# scopes, no advanced help.
+git-back()    { _ou_navcmd back    "$@"; }
+git-forward() { _ou_navcmd forward "$@"; }
+_ou_navcmd() {
+    local dir="$1"; shift
+    local view="" count=1 compact _a
+    compact=$(_ou_cfg_log_compact)
+    _ou_unbundle "$@"; set -- ${OU_UA[@]+"${OU_UA[@]}"}
+    for _a in "$@"; do case "$_a" in -h|--help) [ "$dir" = back ] && _ou_help_back || _ou_help_forward; return 0 ;; esac; done
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s|--status)      case "$view" in ""|status)      view=status ;;      *) view=CONFLICT ;; esac ;;
+            -l|--log)         case "$view" in ""|log)         view=log ;;         *) view=CONFLICT ;; esac ;;
+            -i|--interactive) case "$view" in ""|interactive) view=interactive ;; *) view=CONFLICT ;; esac ;;
+            -c|--compact)     compact=1 ;;
+            -f|--full)        compact=0 ;;
+            *)  case "$1" in
+                    [Aa][Ll][Ll]) count=all ;;          # 'all' = go as far in this direction as the log allows
+                    ''|*[!0-9]*) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2
+                                 { [ "$dir" = back ] && _ou_help_back || _ou_help_forward; } >&2; return 2 ;;
+                    *)           count=$((10#$1)) ;;     # bare number = how many steps
+                esac ;;
+        esac
+        shift
+    done
+    [ "$view" = CONFLICT ] && { echo "${C_ERR}Choose only one of --status, --log, --interactive.${C_RESET}" >&2; return 2; }
+    _ou_require_repo || return 1
+    case "$view" in                                     # a view flag looks instead of moving
+        status)      _ou_status_show navigation; return $? ;;
+        log)         _ou_show navigation "$compact" 0; return $? ;;
+        interactive) _ou_show navigation "$compact" 1; return $? ;;
+    esac
+    [ "$count" != all ] && [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to move (0 requested).${C_RESET}"; return 0; }
+    if [ "$dir" = back ]; then _ou_undo_nav "$count"; else _ou_redo_nav "$count"; fi
 }
 
 git-take() {
@@ -1655,53 +1737,95 @@ _ou_wip_apply() {
 # returning here should land clean, not resurrect an older dirty version). With no $2 it
 # captures the current tree. Returns 0 when safe to clobber the worktree; 1 if the save
 # couldn't be guaranteed (caller must then refuse rather than risk losing work).
+# Do version refs $1 and $2 denote the same working tree? Handles the 'clean' sentinel
+# (clean matches only clean). One git call for the dirty/dirty case.
+_ou_wip_same() {
+    local a="$1" b="$2" t
+    if [ "$a" = clean ] || [ "$b" = clean ]; then [ "$a" = "$b" ]; return; fi
+    t=$(git rev-parse "$a^{tree}" "$b^{tree}" 2>/dev/null)   # both trees, one call (no --verify: rejects 2 args)
+    [ "${t%%$'\n'*}" = "${t##*$'\n'}" ]
+}
+
+# Park the live tracked tree ($2, or a fresh stash; 'clean' for an intentionally empty tree)
+# as a version of base commit $1, honoring this bucket's cursor - so leaving and returning
+# behaves like commit undo/redo:
+#   * tree unchanged from the cursor's version  -> record nothing (you STAY at that point)
+#   * changed while ABOVE older versions (cursor below the tail = you acted after stepping
+#     back) -> drop a resume-point prime of the cursor version, THEN append the change as the
+#     new tail (so the versions above aren't orphaned, exactly like the commit log's B' D)
+#   * changed at the tail                        -> just append the change as the new tail
+# The cursor always ends on the version the worktree now holds, so _ou_wip_restore brings
+# you back to precisely where you left.
 _ou_wip_park() {
-    local base="$1" s="${2:-}" d tl prev arr t
+    local base="$1" s="${2:-}" d tl arr n wcur cur last
     [ -n "$base" ] || return 0
     [ -n "$s" ] || s=$(git stash create "git-undo-redo: worktree @ ${base:0:12}" 2>/dev/null) || return 1
     [ -n "$s" ] || return 0                       # nothing tracked-dirty to park
     d="${_OU_SDIR:-$(_ou_state_dir)}/wip/$base"; mkdir -p "$d" || return 1   # inline dir (no subshell)
     tl="$d/timeline"
-    if [ -s "$tl" ]; then
-        mapfile -t arr < "$tl"; prev="${arr[${#arr[@]}-1]}"   # last line, no `tail` fork
-        if [ -n "$prev" ]; then
-            if [ "$s" = clean ] || [ "$prev" = clean ]; then
-                [ "$s" = "$prev" ] && return 0    # both clean: no new version (the sentinel has no tree)
-            else
-                t=$(git rev-parse "$s^{tree}" "$prev^{tree}" 2>/dev/null)   # both trees, one call (no --verify: rejects 2 args)
-                [ "${t%%$'\n'*}" = "${t##*$'\n'}" ] && return 0   # identical to the last park: no new version
-            fi
+    if [ ! -s "$tl" ]; then
+        [ "$s" = clean ] && return 0              # never START a timeline from a clean tree
+        git update-ref "refs/git-undo-redo/wipkeep/$s" "$s" 2>/dev/null      # gc-protect (clean has no object)
+        printf '%s\n' "$s" >> "$tl" || return 1
+        git cat-file -e "$s" 2>/dev/null || return 1   # verify the snapshot object is really stored
+        printf '0\n' > "$d/cursor"
+        _ou_wip_prune "$base"                      # tidy stale buckets (skip this one - it's alive)
+        return 0
+    fi
+    mapfile -t arr < "$tl"; n=${#arr[@]}          # last line + count without forks
+    wcur=$(( n - 1 )); [ -r "$d/cursor" ] && read -r wcur < "$d/cursor"
+    { [ "$wcur" -ge 0 ] && [ "$wcur" -lt "$n" ]; } || wcur=$(( n - 1 ))
+    cur="${arr[$wcur]%%$'\t'*}"                    # the version the cursor sits on (strip any kind)
+    _ou_wip_same "$s" "$cur" && return 0           # unchanged: stay at this point (cursor persists)
+    if [ "$wcur" -lt $(( n - 1 )) ]; then          # changed after stepping back: keep a resume point
+        last="${arr[$(( n - 1 ))]}"                # ...unless an identical prime is already the tail
+        if ! { [ "${last#*$'\t'}" = prime ] && [ "${last%%$'\t'*}" = "$cur" ]; }; then
+            [ "$cur" = clean ] || git update-ref "refs/git-undo-redo/wipkeep/$cur" "$cur" 2>/dev/null
+            printf '%s\tprime\n' "$cur" >> "$tl" || return 1
+            n=$(( n + 1 ))
         fi
     fi
-    [ "$s" = clean ] || git update-ref "refs/git-undo-redo/wipkeep/$s" "$s" 2>/dev/null   # gc-protect (clean has no object)
+    [ "$s" = clean ] || git update-ref "refs/git-undo-redo/wipkeep/$s" "$s" 2>/dev/null
     printf '%s\n' "$s" >> "$tl" || return 1
-    [ "$s" = clean ] || git cat-file -e "$s" 2>/dev/null || return 1   # verify the snapshot object is really stored
-    _ou_wip_prune "$base"                          # tidy stale buckets (skip this one - it's alive)
+    [ "$s" = clean ] || git cat-file -e "$s" 2>/dev/null || return 1
+    printf '%s\n' "$n" > "$d/cursor"               # cursor -> the just-appended tail
+    _ou_wip_prune "$base"
 }
 
 # Restore the latest parked worktree for base commit $1 onto the (assumed clean) worktree,
 # preserving the staged/unstaged split. Best-effort: an index conflict degrades to an
 # all-unstaged apply (content still safe). Prints a line only when it actually restores.
 _ou_wip_restore() {
-    local base="$1" d tl s arr n
+    local base="$1" d tl s _ss _kk n wcur undo redo
+    local WT_SHA WT_KIND                            # so the version-label helpers can see them
     [ -n "$base" ] || return 0
     d="${_OU_SDIR:-$(_ou_state_dir)}/wip/$base"; tl="$d/timeline"
     [ -s "$tl" ] || return 0                        # no parked work for this branch+commit: 0 forks, done
-    mapfile -t arr < "$tl"; n=${#arr[@]}; [ "$n" -gt 0 ] || return 0   # tail + line count without forks
-    s="${arr[$((n-1))]}"; [ -n "$s" ] || return 0
+    WT_SHA=(); WT_KIND=()
+    while IFS=$'\t' read -r _ss _kk; do [ -n "$_ss" ] && { WT_SHA+=("$_ss"); WT_KIND+=("${_kk:-version}"); }; done < "$tl"
+    n=${#WT_SHA[@]}; [ "$n" -gt 0 ] || return 0     # line count without forks
+    # Return to where the cursor left off (commit-undo parity): if you stepped back with
+    # 'git undo --worktree' and left without changing anything, the cursor still points there.
+    wcur=$(( n - 1 )); [ -r "$d/cursor" ] && read -r wcur < "$d/cursor"
+    { [ "$wcur" -ge 0 ] && [ "$wcur" -lt "$n" ]; } || wcur=$(( n - 1 ))
+    s="${WT_SHA[$wcur]}"; [ -n "$s" ] || return 0   # cursor's version
+    undo="$wcur"; redo=$(( n - 1 - wcur ))          # steps available on each side of the cursor
     if [ "$s" = clean ]; then
         # You left this branch+commit with a CLEAN tree: arriving clean is what you want, so
-        # just record the cursor and say nothing - there's nothing to restore or announce.
-        printf '%s\n' "$(( n - 1 ))" > "$d/cursor" 2>/dev/null
+        # don't restore anything. But if other parked versions sit around it, point them out
+        # with the worktree meter - they're a 'git undo --worktree' away.
+        printf '%s\n' "$wcur" > "$d/cursor" 2>/dev/null
+        [ "$n" -gt 1 ] && echo "${C_OK}↜${C_RESET} ${C_DIM}'git undo --worktree' for an earlier parked version  (undo: $undo · redo: $redo)${C_RESET}"
         return 0
     fi
     if _ou_wip_apply "$s"; then                     # _ou_wip_apply verifies the object itself
-        printf '%s\n' "$(( n - 1 ))" > "$d/cursor" 2>/dev/null   # cursor -> the version we just restored
+        printf '%s\n' "$wcur" > "$d/cursor" 2>/dev/null   # cursor -> the version we just restored
+        local lbl; lbl="$(_ou_wip_vlabel "$wcur") ${C_OK}${s:0:7}${C_RESET}"   # "v7 7207c4f" / "↻ v3 5f36788" (sha green)
         if [ "$n" -gt 1 ]; then                     # meter + hint only when there's somewhere to step
-            echo "${C_OK}↜ Restored your parked changes from ${s:0:7}${C_RESET} ${C_DIM}(undo: $(( n - 1 )) · redo: 0)${C_RESET}"
+            echo "${C_OK}↜ Restored your parked changes from${C_RESET} $lbl ${C_DIM}(undo: $undo · redo: $redo)${C_RESET}"
             echo "  ${C_DIM}Edit and commit, or 'git undo --worktree' for an earlier version.${C_RESET}"
         else
-            echo "${C_OK}↜ Restored your parked changes from ${s:0:7}${C_RESET}"
+            echo "${C_OK}↜ Restored your parked changes from${C_RESET} $lbl"
         fi
     fi
 }
@@ -1742,9 +1866,11 @@ _ou_wip_after() {
 
 # Worktree-version navigation (the `-w`/`--worktree` mode): step through a commit's parked
 # working-tree versions. State per base: the snapshot timeline + a cursor.
-_ou_wip_load() {   # base $1 -> WT_SHA[] (oldest..newest) + WCUR; returns 1 if no parked work
-    local d tl; d="${_OU_SDIR:-$(_ou_state_dir)}/wip/$1"; tl="$d/timeline"; [ -s "$tl" ] || return 1
-    mapfile -t WT_SHA < "$tl"; [ "${#WT_SHA[@]}" -gt 0 ] || return 1
+_ou_wip_load() {   # base $1 -> WT_SHA[]/WT_KIND[] (oldest..newest) + WCUR; returns 1 if no parked work
+    local d tl _s _k; d="${_OU_SDIR:-$(_ou_state_dir)}/wip/$1"; tl="$d/timeline"; [ -s "$tl" ] || return 1
+    WT_SHA=(); WT_KIND=()
+    while IFS=$'\t' read -r _s _k; do [ -n "$_s" ] && { WT_SHA+=("$_s"); WT_KIND+=("${_k:-version}"); }; done < "$tl"
+    [ "${#WT_SHA[@]}" -gt 0 ] || return 1
     WCUR=$(( ${#WT_SHA[@]} - 1 ))
     [ -r "$d/cursor" ] && read -r WCUR < "$d/cursor"
     { [ "$WCUR" -ge 0 ] && [ "$WCUR" -lt "${#WT_SHA[@]}" ]; } || WCUR=$(( ${#WT_SHA[@]} - 1 ))
@@ -1754,28 +1880,39 @@ _ou_wip_save_cursor() { local d; d="${_OU_SDIR:-$(_ou_state_dir)}/wip/$1"; [ -d 
 # Save the current live (unsaved) tracked state as a new tail version on timeline $1 - used
 # when we're about to load a parked version and the worktree holds work that isn't itself a
 # parked version yet (so nothing is lost). No-op (returns 1) if the tree is clean or already
-# identical to the latest version. Appends to the in-scope WT_SHA[] the caller loaded.
+# identical to the latest version. Appends to the in-scope WT_SHA[]/WT_KIND[] the caller
+# loaded. Full symmetry with the leave path (and commit undo/redo): if the cursor sits BELOW
+# the tail (you're saving an edit made after stepping back), drop a resume-point prime of the
+# cursor version first, so the versions above aren't orphaned.
 _ou_wip_stamp_live() {
-    local tl="$1" cs tail t
+    local tl="$1" cs tail t cur last
     cs=$(git stash create 2>/dev/null); [ -n "$cs" ] || return 1
     tail="${WT_SHA[$(( ${#WT_SHA[@]} - 1 ))]}"
     t=$(git rev-parse "$cs^{tree}" "$tail^{tree}" 2>/dev/null)   # both trees in one call (no --verify: it rejects 2 args)
     [ "${t%%$'\n'*}" = "${t##*$'\n'}" ] && return 1
+    if [ "$WCUR" -lt $(( ${#WT_SHA[@]} - 1 )) ]; then            # acted after stepping back: keep a resume point
+        cur="${WT_SHA[$WCUR]}"; last="${WT_KIND[$(( ${#WT_SHA[@]} - 1 ))]:-version}"
+        if ! { [ "$last" = prime ] && [ "$tail" = "$cur" ]; }; then   # ...unless an identical prime is already the tail
+            [ "$cur" = clean ] || git update-ref "refs/git-undo-redo/wipkeep/$cur" "$cur" 2>/dev/null
+            printf '%s\tprime\n' "$cur" >> "$tl"; WT_SHA+=("$cur"); WT_KIND+=("prime")
+        fi
+    fi
     git update-ref "refs/git-undo-redo/wipkeep/$cs" "$cs" 2>/dev/null
-    printf '%s\n' "$cs" >> "$tl"; WT_SHA+=("$cs")
+    printf '%s\n' "$cs" >> "$tl"; WT_SHA+=("$cs"); WT_KIND+=("version")
 }
 
 # Is the cursor's version actually present in the worktree right now? 0 = yes (we got here
 # via goto / a prior --worktree, so stepping is relative to it); 1 = no (e.g. a plain `git switch`
-# bypassed our restore, or there are live edits) - the parked work isn't loaded.
+# bypassed our restore, or there are live edits) - the parked work isn't loaded. This is a
+# READ-ONLY check: `git diff --quiet` compares the live worktree to the cursor version's tree
+# without WRITING objects (the old `git stash create` materialized a throwaway stash just to
+# compare - wasteful for status/log listings).
 _ou_wip_cursor_loaded() {
-    local cs t; cs=$(git stash create 2>/dev/null)
     if [ "${WT_SHA[$WCUR]}" = clean ]; then
-        [ -z "$cs" ]; return   # a 'clean' cursor version is loaded iff the tree is currently clean
+        git diff --quiet HEAD 2>/dev/null                    # 'clean' version loaded iff the tree is clean vs HEAD
+    else
+        git diff --quiet "${WT_SHA[$WCUR]}" -- 2>/dev/null   # dirty version loaded iff the worktree equals its tree
     fi
-    [ -n "$cs" ] || return 1
-    t=$(git rev-parse "$cs^{tree}" "${WT_SHA[$WCUR]}^{tree}" 2>/dev/null)   # both trees in one call (no --verify: it rejects 2 args)
-    [ "${t%%$'\n'*}" = "${t##*$'\n'}" ]
 }
 
 # Is base commit $1 still recoverable WITHOUT the wip itself - reachable from a branch/tag,
@@ -1803,7 +1940,7 @@ _ou_wip_prune() {
         [ "$got" -eq 0 ] && { reflog=$(git reflog --format='%H' 2>/dev/null); got=1; }
         _ou_wip_base_alive "$C" "$reflog" && continue
         if [ -r "$d/timeline" ]; then
-            while read -r s; do [ -n "$s" ] && git update-ref -d "refs/git-undo-redo/wipkeep/$s" 2>/dev/null; done < "$d/timeline"
+            while IFS=$'\t' read -r s _; do [ -n "$s" ] && git update-ref -d "refs/git-undo-redo/wipkeep/$s" 2>/dev/null; done < "$d/timeline"
         fi
         rm -rf "$d" 2>/dev/null
     done
@@ -1815,7 +1952,7 @@ _ou_wip_prune() {
 # its staged/unstaged split. $1 = undo|redo, $2 = count.
 _ou_wip_nav() {
     local dir="$1" count="${2:-1}" base tl n target verb
-    local WT_SHA WCUR
+    local WT_SHA WT_KIND WCUR
     _ou_wip_setcurid base || { echo "${C_DIM}No commit yet - nothing parked.${C_RESET}"; return 1; }
     _ou_wip_load "$base" || { echo "${C_DIM}No parked working changes for this commit.${C_RESET}"; return 1; }
     tl="${_OU_SDIR:-$(_ou_state_dir)}/wip/$base/timeline"
@@ -1831,6 +1968,7 @@ _ou_wip_nav() {
         if [ "$dir" = redo ]; then
             target=$(( pre - 1 ))                       # nothing newer than live work: load the latest
         else
+            [ "$count" = all ] && count=$pre            # 'all' -> the oldest parked version
             target=$(( pre - 1 - (count - 1) ))         # undo: count 1 -> the latest, deeper -> further back
             [ "$target" -lt 0 ] && { echo "${C_ERR}🛑 Only $pre parked version(s); you asked for $count. Nothing changed.${C_RESET}"; return 1; }
         fi
@@ -1838,89 +1976,149 @@ _ou_wip_nav() {
         _ou_wip_apply "${WT_SHA[$target]}"
         WCUR="$target"; _ou_wip_save_cursor "$base"
         if [ "$saved" -eq 1 ]; then
-            echo "${C_OK}↜ Saved your current changes and loaded parked version $(( target + 1 )) of $n${C_RESET} ${C_DIM}(${WT_SHA[$target]:0:7}).${C_RESET}"
+            echo "${C_OK}↜ Saved your current changes and loaded parked version $(_ou_wip_vnum "$target") of $(_ou_wip_vtot)${C_RESET} ${C_DIM}(${WT_SHA[$target]:0:7} · undo: $WCUR · redo: $(( n - 1 - WCUR )))${C_RESET}"
         else
-            echo "${C_OK}↜ Loaded parked version $(( target + 1 )) of $n${C_RESET} ${C_DIM}(${WT_SHA[$target]:0:7}; 'git undo --worktree' for an earlier one).${C_RESET}"
+            echo "${C_OK}↜ Loaded parked version $(_ou_wip_vnum "$target") of $(_ou_wip_vtot)${C_RESET} ${C_DIM}(${WT_SHA[$target]:0:7} · undo: $WCUR · redo: $(( n - 1 - WCUR )))${C_RESET}"
         fi
         return 0
     fi
 
     # The cursor's version IS loaded (goto / a prior --worktree put it there): step relative to it.
-    n="${#WT_SHA[@]}"
+    n="${#WT_SHA[@]}"; local tot; tot=$(_ou_wip_vtot)
     if [ "$dir" = undo ]; then
-        if [ "$WCUR" -le 0 ]; then echo "${C_ERR}🛑 Already at the oldest parked version (1 of $n).${C_RESET}"; return 1; fi
-        [ "$count" -gt "$WCUR" ] && { echo "${C_ERR}🛑 Only $WCUR earlier parked version(s); you asked for $count. Nothing changed.${C_RESET}"; return 1; }
+        if [ "$WCUR" -le 0 ]; then echo "${C_ERR}🛑 Already at the oldest parked version (1 of $tot).${C_RESET}"; return 1; fi
+        [ "$count" = all ] && count=$WCUR               # 'all' -> the oldest parked version
+        [ "$count" -gt "$WCUR" ] && { echo "${C_ERR}🛑 Only $WCUR earlier step(s) back; you asked for $count. Nothing changed.${C_RESET}"; return 1; }
         target=$(( WCUR - count )); verb="↶ Worktree undo"
     else
         local fwd=$(( n - 1 - WCUR ))
-        if [ "$fwd" -le 0 ]; then echo "${C_ERR}🛑 Already at the newest parked version ($n of $n).${C_RESET}"; return 1; fi
-        [ "$count" -gt "$fwd" ] && { echo "${C_ERR}🛑 Only $fwd newer parked version(s); you asked for $count. Nothing changed.${C_RESET}"; return 1; }
+        [ "$count" = all ] && count=$fwd                # 'all' -> the newest parked version
+        if [ "$fwd" -le 0 ]; then echo "${C_ERR}🛑 Already at the newest parked version ($tot of $tot).${C_RESET}"; return 1; fi
+        [ "$count" -gt "$fwd" ] && { echo "${C_ERR}🛑 Only $fwd newer step(s); you asked for $count. Nothing changed.${C_RESET}"; return 1; }
         target=$(( WCUR + count )); verb="↷ Worktree redo"
     fi
     git reset --hard --quiet HEAD 2>/dev/null
     _ou_wip_apply "${WT_SHA[$target]}"
     WCUR="$target"; _ou_wip_save_cursor "$base"
-    echo "${C_OK}${verb} →${C_RESET} parked version $(( target + 1 )) of $n ${C_DIM}(${WT_SHA[$target]:0:7})${C_RESET}"
+    local lbl
+    if [ "${WT_KIND[$target]:-version}" = prime ]; then lbl="a resume point"; else lbl="parked version $(_ou_wip_vnum "$target") of $tot"; fi
+    echo "${C_OK}${verb} →${C_RESET} $lbl ${C_DIM}(${WT_SHA[$target]:0:7} · undo: $WCUR · redo: $(( n - 1 - WCUR )))${C_RESET}"
 }
 
 # `git undo --worktree --log` / `--status` / `--interactive`: show this commit's parked working-
 # tree versions (newest first), or open a picker to load one. Read-only except the picker.
+# Version number for index $1, counting real versions only (resume-point primes don't
+# consume a number). Echoes the bare integer; callers prepend "v".
+_ou_wip_vnum() { local i="$1" j vn=0; for (( j=0; j<=i; j++ )); do [ "${WT_KIND[$j]:-version}" != prime ] && vn=$(( vn + 1 )); done; printf '%d' "$vn"; }
+# Total real versions (primes excluded) in the loaded WT_SHA[].
+_ou_wip_vtot() { local j tot=0; for (( j=0; j<${#WT_SHA[@]}; j++ )); do [ "${WT_KIND[$j]:-version}" != prime ] && tot=$(( tot + 1 )); done; printf '%d' "$tot"; }
+# A prime shares its sha with the real version it resumed from; echo that version's number
+# (the nearest non-prime below it with the same sha), so a row can read "↻ v3".
+_ou_wip_prime_src() { local i="$1" s="${WT_SHA[$1]}" j; for (( j=i-1; j>=0; j-- )); do [ "${WT_KIND[$j]:-version}" != prime ] && [ "${WT_SHA[$j]}" = "$s" ] && { _ou_wip_vnum "$j"; return; }; done; printf '?'; }
+# Colored label for the version at index $1: "v<n>" for a real version, "↻ v<src>" for a
+# resume point (matching the log's coloring) - used in the restore message.
+_ou_wip_vlabel() {
+    if [ "${WT_KIND[$1]:-version}" = prime ]; then printf '%s↻ v%s%s' "$C_RESUME" "$(_ou_wip_prime_src "$1")" "$C_RESET"
+    else printf '%sv%s%s' "$C_UNDO" "$(_ou_wip_vnum "$1")" "$C_RESET"; fi
+}
+# Will row $1 be hidden in compact mode? (a resume point that isn't the cursor's). $2=cursor idx.
+_ou_wip_hidden() { [ "$3" -eq 1 ] && [ "${WT_KIND[$1]:-version}" = prime ] && [ "$1" -ne "$2" ]; }   # $1=idx $2=at $3=compact
+# Legend suffix ", ↻ = resume point" - only when a prime row will actually be shown. $1=compact, $2=cursor idx.
+_ou_wip_legend() {
+    local compact="$1" at="$2" i
+    for (( i=0; i<${#WT_SHA[@]}; i++ )); do _ou_wip_hidden "$i" "$at" "$compact" && continue
+        [ "${WT_KIND[$i]:-version}" = prime ] && { printf ', %s↻%s = resume point' "$C_RESUME" "$C_MUTE"; return; }; done
+}
+
+# Fill WT_STAT[sha] with each parked version's one-line diffstat in a SINGLE git call, so
+# listing the log is one fork instead of one `git stash show` per row (the old "receipt
+# printing"). `git diff-tree --stdin -m` prints each commit's diff against EACH parent; for a
+# `git stash create` commit the FIRST (parent 1 = the base it was taken on) is exactly what
+# `git stash show` reports, so we keep the first shortstat per sha. The caller must have
+# declared `local -A WT_STAT`. 'clean' versions carry no object and need no stat.
+_ou_wip_loadstats() {
+    local s line cur t; local -A _u; local -a uniq=()
+    for s in "${WT_SHA[@]}"; do
+        [ "$s" = clean ] && continue
+        [ -n "${_u[$s]:-}" ] && continue
+        _u[$s]=1; uniq+=("$s")
+    done
+    [ "${#uniq[@]}" -gt 0 ] || return 0
+    while IFS= read -r line; do
+        case "$line" in
+            " "*) [ -n "${cur:-}" ] && [ -z "${WT_STAT[$cur]:-}" ] && { t="${line#"${line%%[![:space:]]*}"}"; WT_STAT[$cur]="$t"; } ;;
+            [0-9a-f]*) cur="$line" ;;
+        esac
+    done < <(printf '%s\n' "${uniq[@]}" | git diff-tree --stdin --shortstat -m 2>/dev/null)
+}
+
 _ou_wip_row() {   # $1=idx into WT_SHA, $2=cursor idx to mark @ (-1 = none), $3=numbered, $4=sel number
-    local i="$1" at="$2" numbered="$3" sn="$4" s mark stat short
-    s="${WT_SHA[$i]}"
+    local i="$1" at="$2" numbered="$3" sn="$4" s k mark stat short
+    s="${WT_SHA[$i]}"; k="${WT_KIND[$i]:-version}"
     [ "$i" -eq "$at" ] && mark=" ${C_AT}@${C_RESET}" || mark="  "
     if [ "$s" = clean ]; then
         short="clean  "; stat="clean working tree"
     else
-        short="${s:0:7}"
-        stat=$(git stash show "$s" 2>/dev/null); stat="${stat##*$'\n'}"; stat="${stat#"${stat%%[![:space:]]*}"}"
-        [ -n "$stat" ] || stat="no tracked changes"
+        short="${s:0:7}"; stat="${WT_STAT[$s]:-no tracked changes}"   # precomputed by _ou_wip_loadstats (one fork)
+    fi
+    if [ "$k" = prime ]; then                       # resume point (↻, per the legend): same tree as the version it marks
+        local src ref; src="v$(_ou_wip_prime_src "$i")"; [ "$s" = clean ] && ref="clean" || ref="${s:0:7}"
+        if [ "$numbered" -eq 1 ]; then
+            printf '%s %2d) %s↻ %s%s %s%s%s  %s\n' "$mark" "$sn" "$C_RESUME" "$src" "$C_RESET" "$C_DIM" "$ref" "$C_RESET" "$stat"
+        else
+            printf '%s  %s↻ %s%s %s%s%s  %s\n' "$(_ou_rel_mark "$i" "$at")" "$C_RESUME" "$src" "$C_RESET" "$C_DIM" "$ref" "$C_RESET" "$stat"
+        fi
+        return
     fi
     if [ "$numbered" -eq 1 ]; then
-        printf '%s %2d) %sv%d%s %s%s%s  %s\n' "$mark" "$sn" "$C_UNDO" "$(( i + 1 ))" "$C_RESET" "$C_DIM" "$short" "$C_RESET" "$stat"
+        printf '%s %2d) %sv%s%s %s%s%s  %s\n' "$mark" "$sn" "$C_UNDO" "$(_ou_wip_vnum "$i")" "$C_RESET" "$C_DIM" "$short" "$C_RESET" "$stat"
     else
-        printf '%s  %sv%d%s %s%s%s  %s\n' "$mark" "$C_UNDO" "$(( i + 1 ))" "$C_RESET" "$C_DIM" "$short" "$C_RESET" "$stat"
+        printf '%s  %sv%s%s %s%s%s  %s\n' "$(_ou_rel_mark "$i" "$at")" "$C_UNDO" "$(_ou_wip_vnum "$i")" "$C_RESET" "$C_DIM" "$short" "$C_RESET" "$stat"
     fi
 }
 
 _ou_wip_status() {
     local base n loadedcur=1
-    local WT_SHA WCUR
+    local WT_SHA WT_KIND WCUR
     _ou_wip_setcurid base || { echo "${C_DIM}No commit yet - nothing parked.${C_RESET}"; return 0; }
     _ou_wip_load "$base" || { echo "${C_DIM}No parked working versions for this commit (${base:0:7}).${C_RESET}"; return 0; }
     n=${#WT_SHA[@]}; _ou_wip_cursor_loaded || loadedcur=0
+    local tot; tot=$(_ou_wip_vtot)                  # real versions (resume points excluded)
     if [ "$loadedcur" -eq 1 ]; then
-        echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET}: ${C_AT}$(( WCUR + 1 )) of $n${C_RESET} loaded ${C_DIM}($WCUR earlier, $(( n - 1 - WCUR )) newer).${C_RESET}"
+        echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET}: ${C_AT}$(_ou_wip_vnum "$WCUR") of $tot${C_RESET} loaded ${C_DIM}($WCUR back, $(( n - 1 - WCUR )) forward).${C_RESET}"
     else
-        echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET}: ${C_AT}$n${C_RESET} saved, none loaded ${C_DIM}('git undo --worktree' brings the latest into your worktree).${C_RESET}"
+        echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET}: ${C_AT}$tot${C_RESET} saved, none loaded ${C_DIM}('git undo --worktree' brings the latest into your worktree).${C_RESET}"
     fi
 }
 
-_ou_wip_show() {   # $1=compact (unused; wip rows are already compact), $2=interactive (0/1)
-    local interactive="$2" base i n at loadedcur=1
-    local WT_SHA WCUR
+_ou_wip_show() {   # $1=compact (1=hide resume points except the cursor's), $2=interactive (0/1)
+    local compact="$1" interactive="$2" base i n at loadedcur=1
+    local WT_SHA WT_KIND WCUR; local -A WT_STAT
     _ou_wip_setcurid base || { echo "${C_DIM}No commit yet - nothing parked.${C_RESET}"; return 0; }
     _ou_wip_load "$base" || { echo "${C_DIM}No parked working changes for this commit.${C_RESET}"; return 0; }
+    _ou_wip_loadstats                               # all diffstats in one git call (shared by log + picker)
     n=${#WT_SHA[@]}; _ou_wip_cursor_loaded || loadedcur=0
     [ "$loadedcur" -eq 1 ] && at="$WCUR" || at=-1
-    [ "$interactive" -eq 1 ] && { _ou_wip_picker "$base" "$at"; return $?; }
-    echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET} ${C_MUTE}(newest first; ${C_AT}@${C_MUTE} = in your worktree now)${C_RESET}:"
-    for (( i=n-1; i>=0; i-- )); do _ou_wip_row "$i" "$at" 0 ""; done
+    [ "$interactive" -eq 1 ] && { _ou_wip_picker "$base" "$at" "$compact"; return $?; }
+    echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET} ${C_MUTE}(newest first; ${C_AT}@${C_MUTE} = current worktree$(_ou_wip_legend "$compact" "$at"))${C_RESET}:"
+    for (( i=n-1; i>=0; i-- )); do _ou_wip_hidden "$i" "$at" "$compact" && continue; _ou_wip_row "$i" "$at" 0 ""; done
     [ "$loadedcur" -eq 0 ] && echo "  ${C_DIM}none loaded - 'git undo --worktree' brings the latest into your worktree.${C_RESET}"
 }
 
 # Picker for the wip scope: pick a parked version and load it (saving any live edits as a
-# new version first). Reads the WT_SHA[]/WCUR the caller loaded; $1=base, $2=cursor idx (@).
+# new version first). Reads the WT_SHA[]/WCUR the caller loaded; $1=base, $2=cursor idx (@),
+# $3=compact (toggleable in-session with 't', like the commit picker).
 _ou_wip_picker() {
-    local base="$1" at="$2" choice sel i n sn saved=0 tl tot
+    local base="$1" at="$2" compact="${3:-0}" choice sel i n sn saved=0 tl
     n=${#WT_SHA[@]}; tl="${_OU_SDIR:-$(_ou_state_dir)}/wip/$base/timeline"
     while :; do
-        echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET} ${C_MUTE}(newest first; ${C_AT}@${C_MUTE} = in your worktree now)${C_RESET}:"
+        echo "Parked working versions for ${C_DIM}${base:0:7}${C_RESET} ${C_MUTE}(newest first; ${C_AT}@${C_MUTE} = current worktree$(_ou_wip_legend "$compact" "$at"))${C_RESET}:"
         sn=0; SEL_IDX=()
-        for (( i=n-1; i>=0; i-- )); do sn=$(( sn + 1 )); SEL_IDX+=("$i"); _ou_wip_row "$i" "$at" 1 "$sn"; done
+        for (( i=n-1; i>=0; i-- )); do _ou_wip_hidden "$i" "$at" "$compact" && continue; sn=$(( sn + 1 )); SEL_IDX+=("$i"); _ou_wip_row "$i" "$at" 1 "$sn"; done
         if [ ! -t 0 ]; then echo; echo "${C_ERR}Not a terminal - re-run interactively to pick a version.${C_RESET}" >&2; return 2; fi
-        read -r -p "${C_DIM}Load 1-${#SEL_IDX[@]}  ·  [q] quit:${C_RESET} " choice
+        read -r -p "${C_DIM}Load 1-${#SEL_IDX[@]}  ·  [t] toggle full/compact  ·  [q] quit:${C_RESET} " choice
         case "$choice" in
+            t|T)      [ "$compact" -eq 1 ] && compact=0 || compact=1; echo; continue ;;
             q|Q|"")   echo "${C_DIM}Cancelled.${C_RESET}"; return 0 ;;
             *[!0-9]*) echo "${C_DIM}Invalid selection.${C_RESET}"; echo; continue ;;
         esac
@@ -1931,11 +2129,11 @@ _ou_wip_picker() {
     _ou_wip_stamp_live "$tl" && saved=1          # never lose live edits
     git reset --hard --quiet HEAD 2>/dev/null
     _ou_wip_apply "${WT_SHA[$sel]}"
-    WCUR="$sel"; _ou_wip_save_cursor "$base"; tot=${#WT_SHA[@]}
+    WCUR="$sel"; _ou_wip_save_cursor "$base"
     if [ "$saved" -eq 1 ]; then
-        echo "${C_OK}↜ Saved your current changes and loaded parked version $(( sel + 1 )) of $tot${C_RESET} ${C_DIM}(${WT_SHA[$sel]:0:7}).${C_RESET}"
+        echo "${C_OK}↜ Saved your current changes and loaded parked version $(_ou_wip_vnum "$sel") of $(_ou_wip_vtot)${C_RESET} ${C_DIM}(${WT_SHA[$sel]:0:7}).${C_RESET}"
     else
-        echo "${C_OK}↜ Loaded parked version $(( sel + 1 )) of $tot${C_RESET} ${C_DIM}(${WT_SHA[$sel]:0:7}).${C_RESET}"
+        echo "${C_OK}↜ Loaded parked version $(_ou_wip_vnum "$sel") of $(_ou_wip_vtot)${C_RESET} ${C_DIM}(${WT_SHA[$sel]:0:7}).${C_RESET}"
     fi
 }
 
@@ -2050,15 +2248,15 @@ _ou_status_show() {
         last=$(( ${#NV_SHA[@]} - 1 ))
         echo "${C_MUTE}HEAD is at:${C_RESET} $(_ou_short)  ${C_MUTE}on${C_RESET} ${C_REDO}$(_ou_nav_where "$NCUR")${C_RESET}"
         if [ "$NCUR" -eq 0 ] && [ "$last" -eq 0 ]; then
-            echo "${C_DIM}No navigation to undo or redo yet - this is the only tracked position.${C_RESET}"
+            echo "${C_DIM}No branch navigation to go back or forward through yet - this is the only tracked position.${C_RESET}"
         else
-            echo "${C_MUTE}Available navigation${C_RESET} $(_ou_nav_meter)"
+            echo "${C_MUTE}Branch navigation${C_RESET} $(_ou_nav_meter)"
         fi
     else
         branch=$(_ou_branch)
         if [ -z "$branch" ]; then
             echo "${C_ERR}❌ The edit log is per-branch, but HEAD is detached.${C_RESET}"
-            echo "   Use 'git undo --status --navigation' for the navigation log."
+            echo "   Use 'git back --status' for the navigation log."
             return 1
         fi
         d=$(_ou_local_dir)            || return 1
@@ -2085,6 +2283,21 @@ _ou_prime_kind() {
         fi
     done
     printf 'commit'   # fallback: the real entry isn't in view (shouldn't happen)
+}
+
+# The log's leading "@" column, with relative distance: "@" at the cursor (green), else the
+# step count away in subdued grey - a glance gives you the N for `git undo N` / `git redo N`
+# (or back/forward N) without competing with the row's own colors. The "@" is indented (" @")
+# so it stands out as the anchor; the numbers are flush-left (the offset reads as secondary)
+# but the content column stays aligned. Distance is the true index gap (what N actually counts),
+# so it's unaffected by compact hiding primes. A cursor of -1 (a worktree log with nothing
+# loaded) yields a blank column. Width 2.
+_ou_rel_mark() {
+    local i="$1" cur="$2" lbl pad="  "
+    [ "$cur" -lt 0 ] && { printf '  '; return; }
+    [ "$i" -eq "$cur" ] && { printf ' %s@%s' "$C_AT" "$C_RESET"; return; }
+    [ "$i" -gt "$cur" ] && lbl=$(( i - cur )) || lbl=$(( cur - i ))
+    printf '%s%s%s%s' "$C_DIM" "$lbl" "$C_RESET" "${pad:${#lbl}}"
 }
 
 # Print the oplog (reads TL_SHA/TL_KIND/CUR, so the caller loads whichever log to
@@ -2148,7 +2361,7 @@ _ou_oplog_print() {
             n=$(( n + 1 )); SEL_IDX+=("$i")
             printf '%s %2d) %s%s%s %s\n' "$mark" "$n" "$kcol" "$kpad" "$C_RESET" "$subj"
         else
-            printf '%s %3d  %s%s%s %s\n' "$mark" "$i" "$kcol" "$kpad" "$C_RESET" "$subj"
+            printf '%s  %s%s%s %s\n' "$(_ou_rel_mark "$i" "$CUR")" "$kcol" "$kpad" "$C_RESET" "$subj"
         fi
     done
     # Below a root branch's oldest edit (its genesis IS the repo's first commit) lies the
@@ -2158,7 +2371,7 @@ _ou_oplog_print() {
     # parentless genesis - never below a `base`, which is already that branch's floor.
     if [ "$navmode" -eq 0 ] && [ "${#TL_SHA[@]}" -gt 0 ] && [ "${TL_KIND[0]}" != floor ] \
        && ! git rev-parse --verify --quiet "${TL_SHA[0]}^" >/dev/null 2>&1; then
-        printf '        %sbase     empty repo - nothing earlier to undo to%s\n' "$C_DIM" "$C_RESET"
+        printf '    %sbase     empty repo - nothing earlier to undo to%s\n' "$C_DIM" "$C_RESET"
     fi
 }
 
@@ -2233,7 +2446,7 @@ _ou_show() {
         branch=$(_ou_branch)
         if [ -z "$branch" ]; then
             echo "${C_ERR}❌ The edit log is per-branch, but HEAD is detached.${C_RESET}"
-            echo "   Use the navigation log instead (e.g. 'git undo --log --navigation')."
+            echo "   Use the navigation log instead (e.g. 'git back --log')."
             return 1
         fi
         d=$(_ou_local_dir)            || return 1
@@ -2262,10 +2475,22 @@ _ou_reset() {
 
     { [ -e "$sdir/nav/timeline" ] || [ -d "$sdir/local" ] || [ -e "$sdir/timeline" ] || [ -d "$sdir/wip" ]; } && had=1
     # Drop the oplog keep-refs AND the wip snapshot refs (parked working-tree versions from
-    # `git goto` / dirty undo-redo), so --reset is a full clear of the tool's tracked state.
-    for r in $(git for-each-ref --format='%(refname)' refs/git-undo-redo/keep/ refs/git-undo-redo/wipkeep/ 2>/dev/null); do
-        git update-ref -d "$r"
+    # `git goto` / dirty undo-redo), so --reset is a full clear of THIS worktree's tracked state.
+    # keep/wipkeep refs live in the SHARED (common) ref store, but each worktree's logs are its
+    # own (under its `--git-dir`); so we delete only the refs whose sha appears in this worktree's
+    # timelines - never another linked worktree's gc-protection. (For a single worktree this is
+    # every ref, identical to before.) Timelines are append-only, so they name every sha that
+    # ever got a keep/wipkeep ref here.
+    local f sha; declare -A _mine=()
+    for f in "$sdir/nav/timeline" "$sdir/timeline" "$sdir"/local/*/timeline "$sdir"/wip/*/timeline; do
+        [ -f "$f" ] || continue
+        while IFS=$'\t' read -r sha _; do [ -n "$sha" ] && [ "$sha" != clean ] && _mine["$sha"]=1; done < "$f"
     done
+    local refname objsha out=""
+    while read -r refname objsha; do
+        [ -n "${_mine[$objsha]:-}" ] && out+="delete $refname"$'\n'
+    done < <(git for-each-ref --format='%(refname) %(objectname)' refs/git-undo-redo/keep/ refs/git-undo-redo/wipkeep/ 2>/dev/null)
+    [ -n "$out" ] && printf '%s' "$out" | git update-ref --stdin 2>/dev/null
     rm -rf "$sdir/nav" "$sdir/local" "$sdir/global" "$sdir/wip" 2>/dev/null   # nav + edit + global cursor + parked wip
     rm -f "$sdir/timeline" "$sdir/cursor" 2>/dev/null   # vestigial pre-split global log
 
@@ -2285,16 +2510,16 @@ _ou_reset() {
 # git-oplog / git-opstatus.
 _ou_moved_hint() {
     case "$1" in
-        *oplog)    echo "${C_DIM}'$1' is now${C_RESET} git undo --log ${C_DIM}(add -e/-n to scope, -i to pick).${C_RESET}" >&2 ;;
-        *opstatus) echo "${C_DIM}'$1' is now${C_RESET} git undo --status ${C_DIM}(add -e/-n to scope).${C_RESET}" >&2 ;;
+        *oplog)    echo "${C_DIM}'$1' is now${C_RESET} git undo --log ${C_DIM}('git back --log' for navigation; -i to pick).${C_RESET}" >&2 ;;
+        *opstatus) echo "${C_DIM}'$1' is now${C_RESET} git undo --status ${C_DIM}('git back --status' for navigation).${C_RESET}" >&2 ;;
     esac
     return 2
 }
 
 # ---- CLI dispatcher: runs only when executed, not when sourced -------
-# Multi-call binary: symlink (or copy) this file to git-undo, git-redo, git-take, git-goto
-# on your PATH; each dispatches by its invoked name. The umbrella name (git-undo-redo)
-# also takes the command as its first arg.
+# Multi-call binary: symlink (or copy) this file to git-undo, git-redo, git-take, git-goto,
+# git-back, git-forward on your PATH; each dispatches by its invoked name. The umbrella name
+# (git-undo-redo) also takes the command as its first arg.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     _ou_load_config     # one git-config read for all undoredo.* keys
     _ou_colors          # set up ANSI colors once (no-op when piped / disabled)
@@ -2303,6 +2528,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         git-redo)               git-redo "$@" ;;
         git-take)               git-take "$@" ;;
         git-goto)               git-goto "$@" ;;
+        git-back)               git-back "$@" ;;
+        git-forward)            git-forward "$@" ;;
         git-oplog|git-opstatus) _ou_moved_hint "$(basename "$0")" ;;   # removed: see hint
         *)
             case "${1:-help}" in
@@ -2310,6 +2537,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
                 redo)           shift; git-redo "$@" ;;
                 take)           shift; git-take "$@" ;;
                 goto)           shift; git-goto "$@" ;;
+                back)           shift; git-back "$@" ;;
+                forward)        shift; git-forward "$@" ;;
                 oplog|opstatus) _ou_moved_hint "git $1" ;;             # removed: see hint
                 reset|--reset)  _ou_reset ;;
                 help|-h|--help) _ou_usage ;;

@@ -9,9 +9,9 @@ work builds on them instead of re-deriving (or accidentally reverting) them.
 
 Undo/redo for git along its two kinds of movable pointer - a branch tip and `HEAD`.
 `git undo` steps back your last *edit* on the current branch (commit, reset, merge,
-rebase, amend); `git undo -n` steps back your last *navigation* (branch switch /
-checkout); `git undo -g` steps back your single most recent operation across *both*,
-in chronological order. `git redo` re-applies. It's modeled on Jujutsu's operation
+rebase, amend); the separate `git back` steps back your last *navigation* (branch switch /
+checkout); the advanced `git undo -g` steps back your single most recent operation across
+*both*, in chronological order. `git redo` / `git forward` re-apply. It's modeled on Jujutsu's operation
 log: private, append-only logs in an orthogonal space inside `.git`.
 
 The two axes are orthogonal and each **atomic in its own domain** - an edit is one
@@ -22,8 +22,8 @@ The **global** view (`-g`/`--global`) is a *third, derived* view: it merges the 
 durable logs by those timestamps into one chronological throughline and walks it,
 dispatching each step to its own axis - composed live at query time, never a third
 stored log. **Edit is the default scope** for a bare command (use `-g`/`--global` for
-this composed view); `git config undoredo.scope` (edit|global|navigation; default edit)
-changes it.
+this composed view; navigation is the separate `git back`/`git forward`); `git config
+undoredo.scope` (edit|global; default edit) changes it.
 
 ## The model
 
@@ -91,6 +91,13 @@ changes it.
 - **GC-proof.** Every state seen gets a keep-ref (`refs/git-undo-redo/keep/<sha>`), so
   gc can never reclaim an undone or abandoned commit - undo/redo work even after the
   reflog fully expires. (Verified with the reflog nuked and `gc --prune=now`.)
+- **Worktree-scoped.** All state lives under `git rev-parse --git-dir`, which is
+  per-worktree for linked `git worktree`s - so each worktree has its own independent
+  edit/nav/wip logs and cursors. Keep/wipkeep refs sit in the shared (common) ref store, but
+  `git undo --reset` deletes only the refs whose sha appears in the *current* worktree's
+  timelines, so resetting one worktree never strips another's gc-protection (genuinely shared
+  commits stay reachable via their branches regardless). For a single worktree this is exactly
+  "delete everything," unchanged.
 - **Catch-up, not hooks.** No daemon. The navigation log re-reads new checkouts from
   the reflog each command - a count watermark (`nav/seen`) tracks how far it has
   consumed, so even a net-zero switch-away-and-back is caught (switches have no
@@ -108,9 +115,9 @@ changes it.
 
 Four `git config` keys (read at runtime; per-invocation flags always override):
 
-- `undoredo.scope` = `edit` | `global` | `navigation` (default `edit`) - the scope of
-  a bare `git undo` / `git redo` and their `--status`/`--log` views (each also takes
-  `-e`/`--edit`, `-n`/`--navigation`, and `-g`/`--global`).
+- `undoredo.scope` = `edit` | `global` (default `edit`) - the scope of a bare `git undo` /
+  `git redo` and their `--status`/`--log` views (each also takes `-e`/`--edit` and
+  `-g`/`--global`). Branch navigation is the separate `git back` / `git forward` commands.
 - `undoredo.log` = `full` | `compact` (default `full`) - the default `git undo --log`
   density (`-c`/`-f` override).
 - `undoredo.take` = `unstaged` | `staged` (default `unstaged`) - whether `git take`
@@ -133,7 +140,9 @@ so alignment is unaffected. Help screens (`-h`) are intentionally left plain.
 .git/git-undo-redo/nav/              the navigation log (timeline "<sha>\t<kind>\t<ref>\t<ts>", cursor, seen)
 .git/git-undo-redo/local/<branch>/   a per-branch edit log (timeline "<sha>\t<kind>\t<ts>" + cursor)
 .git/git-undo-redo/global/cursor     where you are in the (derived) global view - a single int
+.git/git-undo-redo/wip/<commit>@<branch>/   parked-worktree versions (timeline "<sha>" or "<sha>\tprime" + cursor)
 refs/git-undo-redo/keep/<sha>        one ref per state (GC protection); packed by git gc
+refs/git-undo-redo/wipkeep/<sha>     one ref per parked-worktree snapshot (GC protection)
 ```
 
 (`<branch>` is the branch name with `/` percent-encoded so it's one path component.)
@@ -215,10 +224,16 @@ that undo/redo inherently produce (and which we strip back out on seed).
   `undoredo.take=staged`) also writes the index. Clean tree + a non-detached HEAD
   required. The removed `git undo --staged` flow is now just `git undo` then `git take`.
 - **oplog / picker** (`_ou_show` → `_ou_oplog_print` / `_ou_oplog_interactive`): render
-  the chosen log - `-e` edit / `-n` navigation (default `undoredo.scope`). The printer
-  reads a generic `TL_*` buffer that `_ou_show` copies the chosen log into. `-c` hides
-  primes; `-i` is a picker (cursor move, no new op): an edit pick resets the branch and
-  saves the edit cursor, a nav pick is one atomic checkout.
+  the chosen log - `-e` edit / `-g` global; `git back`/`git forward` render the nav log. The
+  printer reads a generic `TL_*` buffer that `_ou_show` copies the chosen log into. In log
+  view the leading "@" column carries a RELATIVE number (`_ou_rel_mark`, shared with the
+  worktree log): "@" at the cursor (green), else the step distance to it in subdued grey - so
+  the column reads straight off as the N for `undo N` / `redo N` / `back N` / `forward N`. It's
+  the true index gap (what N counts), so compact hiding a prime leaves an absolute gap rather
+  than renumbering. The numbers are quick-reference (dim, no legend). `-c` hides primes;
+  `-i` is a picker that keeps its own 1..N selection numbers (no relative numbers) - a cursor
+  move, no new op: an edit pick resets the branch and saves the edit cursor, a nav pick is one
+  atomic checkout.
 - **reset** (`_ou_reset`, `git undo --reset`): delete the nav + per-branch logs,
   keep-refs, AND the parked wip buckets + wipkeep refs (a full state clear); the next
   command re-seeds the logs from the live reflog. A rebuild, not a wipe (re-deriving from

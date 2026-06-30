@@ -7,7 +7,8 @@ Guidance for AI agents (and humans) working on this repo. Read
 `git-undo-redo` - undo/redo for git along its two axes, plus a derived global view. One
 bash script ([`git-undo-redo`](git-undo-redo)) that's a **multi-call binary**: it
 dispatches on `basename "$0"` and is installed (via [`install.sh`](install.sh)) symlinked
-or copied to `git-undo`, `git-redo`, `git-take`, `git-goto` on `PATH`. The old `git-oplog`
+or copied to `git-undo`, `git-redo`, `git-take`, `git-goto`, `git-back`, `git-forward` on
+`PATH`. The old `git-oplog`
 / `git-opstatus` commands were folded into `git undo`/`git redo` as the `--log`/`-l` and
 `--status`/`-s` flags (with `-c`/`--compact` and `-f`/`--full` for log density); the
 removed names still dispatch to a one-line "moved to" hint (`_ou_moved_hint`).
@@ -59,11 +60,12 @@ calls it loaded iff the tree is currently clean, rows show "clean working tree",
 `wipkeep` ref (nothing to gc-protect). Dedup is literal for `clean`, by-tree otherwise.
 
 `git undo -w`/`git redo -w` (`--worktree`, a top-level undo/redo mode - NOT a scope like
-`-e`/`-n`/`-g`, and shown in the main help) walk the parked-worktree timeline for the
+`-e`/`-g`, and shown in the main help) walk the parked-worktree timeline for the
 current commit instead of moving HEAD (`_ou_wip_nav`), persisting the
 position in `.git/git-undo-redo/wip/<base>/cursor`. It first asks whether the cursor's
-version is actually in the worktree (`_ou_wip_cursor_loaded`: a fresh `git stash create`
-tree vs the cursor snapshot's tree). Two paths:
+version is actually in the worktree (`_ou_wip_cursor_loaded`: a READ-ONLY
+`git diff --quiet <cursor>` - no `git stash create`, which would write throwaway objects just
+to compare). Two paths:
 - **Loaded** (got here via `goto` or a prior `--worktree`): step relative to the cursor.
   Boundary/too-many checks mirror the HEAD scopes (refuse-on-overshoot, "Only N
   earlier/newer parked version(s)"; never clamp).
@@ -74,13 +76,43 @@ tree vs the cursor snapshot's tree). Two paths:
   This mirrors `git goto`'s park-what-you-leave / restore-what-you-land-on behavior for the
   case where the auto-park hook never ran.
 
+**Cursor persistence + resume-point primes (commit-undo parity).** The auto-park/restore
+hooks (`_ou_wip_park` on leave, `_ou_wip_restore` on return) honor the bucket's cursor, so
+the parked-worktree timeline behaves like the commit log. On leave, the live tree is compared
+to the version the cursor sits on (not the tail): if unchanged, nothing is recorded and the
+cursor stays put, so stepping back with `git undo -w` and then leaving (goto / a HEAD
+undo/redo) returns you to that same version. If changed while the cursor is BELOW the tail
+(you acted after stepping back), a resume-point prime of the cursor version is appended first,
+THEN the change as the new tail - the `[A,B,C,B',D]` shape from the commit log, so the
+versions above are never orphaned. **Full symmetry:** this prime fires for ANY movement-driven
+auto-save of a below-tail edit, not just the leave path - `_ou_wip_stamp_live` (the save
+`git undo -w`/`git redo -w`/the picker do when the worktree holds an unsaved edit) primes the
+same way. Primes are timeline lines tagged `<sha>\tprime` (real versions are bare `<sha>`);
+`_ou_wip_load` splits the kind into `WT_KIND[]`. A prime shares its sha with the real version
+it resumed from, so it renders as a cyan `↻ v<src> resume point <clean|diffstat>` row
+(`_ou_wip_prime_src` finds `<src>`; the clean/diffstat is computed exactly like a real row)
+and does NOT consume a `vN` number (`_ou_wip_vnum`/`_ou_wip_vtot` count real versions only) -
+but it IS a positional step for `git undo -w`. `-c`/`--compact` (and `undoredo.log=compact`,
+and the picker's in-session `t` toggle) hide resume-point rows from the worktree log/picker
+except the cursor's - exactly like the commit log; `-f`/`--full` shows them. `_ou_wip_hidden`
+gates each row and `_ou_wip_legend` only prints the `↻ = resume point` legend when one is
+actually shown. On return, `_ou_wip_restore` brings back
+`V[cursor]` (not always the latest) and its meter is `(undo: cursor · redo: n-1-cursor)`; a
+clean cursor version lands clean, adding a worktree hint only when other versions exist. Users
+who never touch `git undo -w` keep the cursor at the tail, so this path is identical to plain
+append-on-change (no primes ever appear).
+
 All snapshot applies go through `_ou_wip_apply`: `git stash apply --index` to preserve the
 staged/unstaged split, degrading on an index conflict to a flat apply that then stages per
 `undoredo.take` (default unstaged) - the one case where the split can't be reproduced lands
 the way `git take` would. The `--worktree` mode also drives the views: `git undo --log -w`
 (`_ou_wip_show`), `--status -w` (`_ou_wip_status`), and `--interactive -w` (`_ou_wip_picker`,
 which loads a chosen version, stamping live edits first). Rows show `vN <short> <diffstat>`,
-`@` marks the version currently in the worktree (none after a plain switch).
+`@` marks the version currently in the worktree (none after a plain switch). Listing is a flat
+cost: every version's diffstat comes from ONE `git diff-tree --stdin --shortstat -m`
+(`_ou_wip_loadstats` fills `WT_STAT[sha]`; for a stash the first shortstat = parent-1/base diff
+= what `git stash show` prints) instead of one `git stash show` fork per row - so the log no
+longer "receipt-prints" or scale with version count.
 
 Auto-prune (`_ou_wip_prune`, fired after each successful park) is conservative: a wip
 bucket is removed only when its COMMIT (the part before `@` in the id) is unreachable from
@@ -89,11 +121,15 @@ itself could no longer restore it. Anything still recoverable by reflog is kept.
 
 Two orthogonal logs, both seeded from git's **HEAD reflog** then **persisted to disk
 with a per-entry reflog event-time** (so they outlive the reflog): the per-branch **edit
-log** (`-e`/`--edit`) keeps the edits made on a branch; the **navigation log**
-(`-n`/`--navigation`) keeps branch switches / checkouts. `git undo N` / `git redo N` jump
-N steps in these scopes (refusing, and reporting the count, if too many) - **atomic in
-both domains**: an edit is one `reset` of the current branch (`_ou_local_goto`), a
-navigation is one `checkout` (`_ou_nav_goto`). No walking in the per-axis case - the old
+log** drives `git undo`/`git redo` (the `-e`/`--edit` scope, the default); the
+**navigation log** drives the SEPARATE `git back` / `git forward` commands (their own
+`git-back`/`git-forward` dispatch + `_ou_navcmd`, sharing `_ou_undo_nav`/`_ou_redo_nav`),
+so undo/redo never yank your branch. `git undo N` / `git back N` jump N steps (refusing,
+and reporting the count, if too many); the literal `all` (any case) resolves to that
+direction's `avail` in each handler, so `git undo all`/`git redo all`/`git back all`/`git
+forward all` (and the `-g`/`-w` variants) jump straight to the oldest/newest point - **atomic
+in both domains**: an edit is one `reset`
+of the current branch (`_ou_local_goto`), a navigation is one `checkout` (`_ou_nav_goto`). No walking in the per-axis case - the old
 single *mixed* global log needed it; splitting the axes removed the need and the
 checkout/edit ambiguity.
 
@@ -142,7 +178,7 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
 - **The global cursor is only valid inside a LIVE walk - guard it with the throughline
   length, not just sha/ref.** A position (sha, ref) repeats in the throughline (a branch
   revisited at the same commit), so "stored index still matches HEAD's sha/ref" is NOT
-  enough to trust it: after a per-axis op moves HEAD on another axis (a `git undo -n` then
+  enough to trust it: after a per-axis op moves HEAD on another axis (a `git back` then
   a manual switch, a commit, etc.) the stored index can match HEAD at an *older duplicate*
   occurrence, making the global log disagree with the nav/edit logs and offer phantom redo.
   `_ou_global_goto` stores the index AND `${#GL_SHA[@]}`; the derive trusts it only when the
@@ -194,7 +230,8 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   oplog from the reflog (it does NOT wipe - re-deriving is the model; never anchor a
   single entry instead). `--status`/`--log`/`--interactive` are mutually exclusive views.
   No within-command duplicate short letters. Defaults:
-  `undoredo.scope` (edit|global|navigation; default edit), `undoredo.log` (full|compact),
+  `undoredo.scope` (edit|global; default edit - navigation is `git back`/`git forward`),
+  `undoredo.log` (full|compact),
   `undoredo.take` (unstaged|staged), and `undoredo.color` (auto|always|never); flags
   override.
 - **Output color** is via the `C_*` vars set by `_ou_colors` (empty unless a TTY /

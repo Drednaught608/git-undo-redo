@@ -53,13 +53,13 @@ Switched to branch 'feature'
 
 $ git goto main            # ...and your half-finished work is waiting when you return
 Switched to branch 'main'
-↜ Restored your parked changes from 65245e8
+↜ Restored your parked changes from v1 65245e8
 ```
 
-That's the whole everyday tool: **`git undo`, `git redo`, `git take`, and `git goto`.** It
-also keeps a full, browsable undo history with finer-grained scopes - but that's optional
-power, under **Advanced** and **How it works** below. You never need any of it for the
-four commands above.
+That's the whole everyday tool: **`git undo`, `git redo`, `git take`, and `git goto`** -
+plus **`git back`** / **`git forward`** when you want to step through *branch switches*
+(navigation undo/redo). It also keeps a full, browsable history - but that's optional
+power, under **Advanced** and **How it works** below.
 
 ## Install
 
@@ -78,7 +78,7 @@ cd git-undo-redo
 ./install.sh --bin ~/bin     # ...or a directory of your choice
 ```
 
-The installer drops four commands (`git-undo`, `git-redo`, `git-take`, `git-goto`) into
+The installer drops six commands (`git-undo`, `git-redo`, `git-take`, `git-goto`, `git-back`, `git-forward`) into
 the target directory. If that directory isn't on your
 `PATH` yet, it offers to add the line to your shell's rc file (`~/.bashrc` or
 `~/.zshrc`) for you; decline and it just prints the command to run yourself.
@@ -93,30 +93,31 @@ the target directory. If that directory isn't on your
 
 ## Command reference
 
-Day to day it's `git undo`, `git redo`, `git take`, and `git goto` (above). The rest -
-scopes, the history browser, status - is optional power, summarized here and explained
-under **Advanced** and **How it works** below.
+Day to day it's `git undo`, `git redo`, `git take`, and `git goto` (above), plus `git back`
+/ `git forward` for branch navigation. The rest - the combined view, the history browser,
+status - is optional power, summarized here and explained under **Advanced** below.
 
 | Command | What it does |
 | --- | --- |
-| `git undo` | Undo the last edit on this branch - a commit, an amend, a reset - whichever was most recent; your files follow. This is the default. (Add `-g` to undo across branch switches too, or change the default with `undoredo.scope`.) |
-| `git undo -e` / `--edit` | Undo just this branch's edits (commit, reset, merge, rebase, amend) - the default scope, stated explicitly. |
-| `git undo -n` / `--navigation` | Undo just your last *branch switch / checkout* - one move back to where you were (works on a detached HEAD too). |
-| `git undo -g` / `--global` | Undo your single most recent change across **both** your edits and your branch switches, whichever came last. A step can move you to another branch (the message says where you land). |
-| `git undo N` / `git redo N` | Undo / redo `N` at once (e.g. `git undo 3`). Refuses and reports how many are available if `N` is too many. |
-| `git redo` / `-e` / `-n` / `-g` | Re-apply your last undone change - this branch's edits by default (`-e`), a branch switch (`-n`), or across everything (`-g`). |
+| `git undo` | Undo the last edit on this branch - a commit, an amend, a reset - whichever was most recent; your files follow. This is the default. (For branch switches, see `git back`; `-g` is an advanced cross-axis variant.) |
+| `git undo -e` / `--edit` | Undo just this branch's edits (commit, reset, merge, rebase, amend) - the default, stated explicitly. |
+| `git redo` / `git redo N` | Re-apply your last undone edit (`git redo 2` re-applies two). Same flags as `git undo`. |
+| `git back` / `git back N` | Step **back** through your *branch switches / checkouts* - one atomic checkout to where you were (a detached HEAD too); `git back N` jumps N. The navigation counterpart to `git undo`: your branch tips and edits are untouched. Add `-s`/`-l`/`-i` to look without moving. |
+| `git forward` / `git forward N` | Re-do a branch switch you stepped back from with `git back` - the navigation counterpart to `git redo`. |
+| `git undo -g` / `--global` | **Advanced.** Undo your single most recent change across **both** your edits and your branch switches, whichever came last - one combined timeline. A step can move you to another branch (the message says where you land). |
+| `git undo N` / `git back N` ... | Do `N` at once (e.g. `git undo 3`). Refuses and reports how many are available if `N` is too many. Use `all` instead of a number (`git undo all`, `git redo all`, `git back all`, `git forward all`) to go as far as that direction allows - to the oldest/newest point. |
 | `git take` | Copy the branch's **latest** edit (the top of the edit log) into your files **without moving** `HEAD` - the common flow is `git undo` to look back, then `git take` to pull your newest work in. Lands unstaged by default. Edit-based (reads the current branch's log); needs a clean tree and a branch. |
 | `git take N` | Reach the commit `N` entries above your current point (so `git take 1` is the closest one above you, `git take 2` further up). Applies that commit's full tree wholesale. Refuses, changing nothing, if there are fewer than `N` commits above you. |
 | `git goto <branch>` | `git switch` that handles your uncommitted work for you instead of refusing. Parks your dirty **tracked** files (staged **and** unstaged) against the commit you leave - they leave the working tree - switches, then restores whatever you'd parked against the commit you land on, no manual stash/pop. Your work waits where you left it (not on the new branch); per-commit, so changes left against different commits each come back where you left them. Untracked files travel with the switch as usual; your `git stash` stack is never touched. All `git switch` options pass through. |
-| `git undo --status` / `-s` | Show the current `HEAD` and how many undo / redo steps remain, for the current branch's edits (default), across everything (`-g`), or branch switches (`-n`). Read-only; `git redo --status` shows the same thing. |
-| `git undo --log` / `-l` | Show the current branch's **edit log**, newest first, with `@` marking where you are. `-g`/`--global` shows the composed **global log**, `-n`/`--navigation` the **navigation log**. (`-c`/`--compact` hides resume points (↻); `-f`/`--full` is the default.) Read-only. |
-| `git undo -i` / `--interactive` | Show that log (edit, navigation, or global via `-e`/`-n`/`-g`) as a picker and drop straight to a point you choose (`-c`/`-f` set the initial density, `t` toggles it in-screen). A cursor move; for navigation it's a single atomic checkout. |
+| `git undo --status` / `-s` | Show the current `HEAD` and how many undo / redo steps remain, for the current branch's edits (default) or across everything (`-g`). Read-only; `git redo --status` shows the same. (`git back --status` for branch navigation.) |
+| `git undo --log` / `-l` | Show the current branch's **edit log**, newest first, with `@` marking where you are; `-g`/`--global` shows the combined log. (`-c`/`--compact` hides resume points (↻); `-f`/`--full` is the default.) Read-only. (`git back --log` shows the navigation log.) |
+| `git undo -i` / `--interactive` | Show that log (edit, or global via `-g`) as a picker and drop straight to a point you choose (`-c`/`-f` set the initial density, `t` toggles it in-screen). A cursor move. (`git back -i` picks a navigation point.) |
 | `git undo --reset` | Drop the tracked logs (navigation + per-branch edit logs) so they rebuild cleanly from git's reflog on the next command (a rebuild, not a wipe - recent history stitches back; accumulated tracking older than the reflog, resume points, and any wedged state are dropped). Also clears parked working-tree versions (from `git goto` / `git undo --worktree`). Your commits and current working tree are untouched. Long form only. |
-| `git undo --worktree` / `-w` | Step **back** through earlier parked versions of your **uncommitted work** at the current commit, without moving `HEAD` (`git redo -w` steps forward). Every `git goto` / dirty undo / redo snapshots the worktree, so this is your worktree's own undo history. If you reached the commit with a plain `git switch` (so the parked work isn't loaded), the first `git undo --worktree` brings your **latest** parked version back into the worktree - saving any current edits as a new version first, so nothing is lost. Add `--log` / `--status` / `--interactive` to list the versions, see where you are, or pick one to load. Refuses at the ends, and if you ask for more than exist. Stale parked versions are pruned automatically once git itself can no longer reach the commit they belong to. |
+| `git undo --worktree` / `-w` | Step **back** through earlier parked versions of your **uncommitted work** at the current commit, without moving `HEAD` (`git redo -w` steps forward). Every `git goto` / dirty undo / redo snapshots the worktree, so this is your worktree's own undo history. If you reached the commit with a plain `git switch` (so the parked work isn't loaded), the first `git undo --worktree` brings your **latest** parked version back into the worktree - saving any current edits as a new version first, so nothing is lost. Your position is remembered: step back to an earlier version, leave (via `git goto` or a normal undo/redo) without changing anything, and you return to that same version - but change it first and the change is saved as a new version with a **resume point** (↻) at the one you stepped back from, so nothing above is lost (exactly like commit undo/redo). Add `--log` / `--status` / `--interactive` to list the versions, see where you are, or pick one to load. Refuses at the ends, and if you ask for more than exist. Stale parked versions are pruned automatically once git itself can no longer reach the commit they belong to. |
 
-Behavior is configurable via `git config` - the scope of a bare command, the `--log` density, where `git take` lands, and color. See **[Configuration](#configuration)** below; flags always override the config. Short flags can be bundled - `git undo -nl` is `git undo -n -l`, and so on (a count stays separate: `git undo -e 3`, not `-e3`).
+Behavior is configurable via `git config` - the scope of a bare command, the `--log` density, where `git take` lands, and color. See **[Configuration](#configuration)** below; flags always override the config. Short flags can be bundled - `git undo -sl` is `git undo -s -l`, and so on (a count stays separate: `git undo -e 3`, not `-e3`).
 `git undo -h` shows the everyday flags (status, log, the picker); `git undo -h -a`
-(`--advanced`) adds the scopes (`-e`/`-n`/`-g`) and `--reset`. Use `-h`, not `--help`,
+(`--advanced`) adds `-e`/`-g` and `--reset`. Use `-h`, not `--help`,
 after `git undo`: git itself reserves
 `git <cmd> --help` for a manual-page lookup (it never reaches this tool), so
 `git undo --help` reports "documentation file not found" rather than showing help. (`-h`
@@ -130,13 +131,18 @@ Available globally (all operations, in order) (undo: 4 · redo: 1)
 
 $ git undo --log
 Global operation log (newest first; @ = current position):
-     5  commit    main (at e4f5a6b Wire up validation)
- @   4  commit    main (at a1b2c3d Add login form)
-     3  checkout  main (at 9c0ffee Refactor parser)
-     2  checkout  feature (at edf1cd2 Scaffold routes)
-     1  commit    main (at 1b2c3d4 Initial parser)
-     0  commit    main (at 0a1b2c3 Project skeleton)
+1   commit    main (at e4f5a6b Wire up validation)
+ @  commit    main (at a1b2c3d Add login form)
+1   checkout  main (at 9c0ffee Refactor parser)
+2   checkout  feature (at edf1cd2 Scaffold routes)
+3   commit    main (at 1b2c3d4 Initial parser)
+4   commit    main (at 0a1b2c3 Project skeleton)
 ```
+
+The number on each row is **how far it is from where you are** (`@`) - read it straight off as
+the argument: `git undo 2` lands on *Scaffold routes*, `git redo 1` on *Wire up validation*.
+Or skip counting and jump to the end - `git undo all` to the oldest, `git redo all` to the
+newest (same for `git back` / `git forward`).
 
 ## Configuration
 
@@ -150,7 +156,7 @@ and edit a value in place:
 
 ```ini
 [undoredo]
-    scope = edit        # edit | global | navigation   - scope of a bare undo/redo (and --status / --log)
+    scope = edit        # edit | global                 - scope of a bare undo/redo (and --status / --log)
     log   = full        # full | compact               - density of `git undo --log`
     take  = unstaged    # unstaged | staged            - where `git take` puts the changes
     color = auto        # auto | always | never        - colored output (auto = only to a terminal)
@@ -190,70 +196,37 @@ actually differ from where you are show up, you get that commit's version of eac
 than any in-between one, and deletions are handled). It needs a clean tree and a branch,
 and refuses, changing nothing, if there's nothing above you (or fewer than `N` commits).
 
-## Advanced: edit, navigation, and global scopes
+## Advanced: branch navigation, and the combined view
 
-You can stop at `git undo` / `git redo` / `git take` - this section is for when you want
-finer control, and most users never need it. There are really two kinds of "undo": your
-**edits** on a branch, and your **branch switches**. The tool keeps a separate log for
-each, plus a third **global** scope that composes both, newest first. The three are
-independent:
+You can stop at the everyday commands - this section is for finer control, and most users
+never need it. There are two kinds of "undo": your **edits** on a branch, and your
+**branch switches**. Each has its own command, so neither yanks the other:
 
-- **`git undo`** (edit, the default) steps back one *edit* on the branch you're currently
-  on - commit, reset, merge, rebase, amend - using that branch's own log. It only moves
-  the current branch's tip, so you can hop to any branch and undo its last edit. `-e`
-  states this scope explicitly, and `git undo 3` is just three undos.
-- **`git undo -n`** (navigation) steps back one *branch switch / checkout* (a detached
-  checkout too) - one `git checkout` back to where you were.
-- **`git undo -g`** (global) steps back your single most recent change across *both* your
-  edits and your branch switches - whatever you did last, be it a commit, a switch, or a
-  reset. A step can move you to another branch (the message says where you land). It's
-  built on demand from the other two logs, never stored separately, so it keeps working
-  even after git expires its reflog.
+- **`git undo` / `git redo`** step through this branch's *edits* (commit, reset, merge,
+  rebase, amend), using that branch's own log. They only move the current branch's tip, so
+  you can hop to any branch and undo its last edit. `-e` states this default explicitly,
+  and `git undo 3` is just three undos.
+- **`git back` / `git forward`** step through your *branch switches / checkouts* - one
+  atomic checkout back to where you were (a detached HEAD too). Navigation only: they never
+  touch a branch tip or an edit. `git back N` jumps N; add `-s`/`-l`/`-i` to look first.
 
-Edit, on `main`, undoing the last edit made on main (its own log and counter):
+Keeping them apart is the point: `git undo` never pulls you to another branch, and
+`git back` never rewrites a commit. Each moves in a single step (one reset, or one
+checkout), so it never replays unrelated history.
 
 ```console
-$ git undo -e
+$ git undo                       # this branch's last edit
 ↶ Undo edit on main → 9c0ffee Refactor parser  (undo: 2 · redo: 1)
+
+$ git back                       # your last branch switch
+↶ Back → on feature  (back: 6 · forward: 1)
 ```
 
-Navigation - you switched from `feature` back to `main`; `git undo -n` puts you
-back on `feature` in one checkout:
-
-```console
-$ git undo -n
-↶ Undo (checkout) → on feature  (undo: 6 · redo: 1)
-
-$ git undo --log -n
-Navigation log (newest first; @ = current position):
- @   3  checkout  feature (at 1f3a9c2 Add parser tests)
-     2  checkout  main (at a1b2c3d Add login form)
-     1  checkout  feature (at edf1cd2 Scaffold routes)
-     0  checkout  main (at 0a1b2c3 Project skeleton)
-```
-
-Global - your most recent change, whichever kind it was. `git undo -g` steps back across
-both axes; here the last thing you did was a commit on `main`, so it steps that back, and
-the composed log shows both kinds in one timeline:
-
-```console
-$ git undo -g
-↶ Undo → 40778a3 Initial parser on main  (undo: 4 · redo: 1)
-
-$ git undo --log -g
-Global operation log (newest first; @ = current position):
-     5  commit    main (at 40778a3 Initial parser)
- @   4  checkout  main (at 40778a3 Initial parser)
-     3  checkout  feature (at 40778a3 Initial parser)
-     2  commit    main (at ebbb41f Refactor parser)
-     1  commit    feature (at cbdb5f3 Scaffold routes)
-     0  commit    main (at b6e29a4 Project skeleton)
-```
-
-Edit and navigation each move in one step: an edit is a single reset of one branch, a
-branch switch is a single checkout. Neither has to replay unrelated steps - which is the
-whole point of keeping them apart. Global is the one scope that goes step by step, since
-each step may be an edit or a switch.
+There's also an **advanced combined view**, `git undo -g` / `--global`: it undoes your
+single most recent change across *both* axes (an edit or a switch), in time order - so a
+step can land you on another branch. It's derived on demand from the two logs (never stored
+as a third), so it survives git expiring its reflog. Most people never need it - `git undo`
+and `git back` cover the two cases cleanly.
 
 ## How it works
 
@@ -276,18 +249,12 @@ contributors.
   `local/<branch>/`, each a timeline + cursor), plus `refs/git-undo-redo/keep/<sha>` -
   one ref per state ever seen, so git's gc can never reclaim an undone or abandoned
   commit.
-- **Global is derived, never stored.** The global scope merges the two durable logs
-  by their stored event times into one timeline (dropping each log's internal
-  scaffolding, keeping resume points), then steps through it - each step an edit reset
-  or a branch checkout. It's never written as a third log; only the
-  global cursor (`.git/git-undo-redo/global/cursor`, a single integer) is kept. Reading
-  the durable logs rather than the live reflog is exactly what lets it survive reflog
-  expiry.
 - **Cursors self-heal.** Each log's cursor self-heals to wherever `HEAD` / the branch
-  tip actually is, so the edit, navigation, and global views stay correct and
-  independent even after a global undo into another branch or a manual `git checkout` / `reset`.
-  You can global-undo into another branch, manually check out back, and that branch's
-  edit redos are still right where you left them - and vice-versa for navigation.
+  tip actually is, so the edit log (`git undo`) and the navigation log (`git back`) stay
+  correct and independent even after a manual `git checkout` / `git reset`. They're kept
+  apart on purpose: undoing an edit never moves you to another branch, and `git back`
+  never rewrites a commit. (The advanced `git undo -g` combined view is derived from the
+  two on demand - never stored as a third log - so it survives reflog expiry too.)
 - **Durable against branch deletion.** Because the edit log is read from the HEAD
   reflog and not from a branch's own reflog, deleting (or recreating) a branch never
   loses its edit history - `git branch -d` deletes the branch reflog, but the edits
@@ -300,13 +267,12 @@ contributors.
   marked with `↻`, e.g. `↻ commit` in the edit log, `↻ checkout` in the navigation log -
   the log header explains it whenever one is present.)
 - **Atomic in each domain.** An edit is a single `reset` of one branch; a navigation
-  is a single `checkout` (recreating the branch if you'd deleted it, never detaching
-  unless you asked to). So `git undo N` is a direct jump to that point, not a step-by-step
-  replay - the one exception being `git undo -g N`, which goes one at a time, since each
-  step may be an edit or a switch.
+  (`git back`) is a single `checkout` (recreating the branch if you'd deleted it, never
+  detaching unless you asked to). So `git undo N` / `git back N` is a direct jump to that
+  point, not a step-by-step replay.
 - **Seeded from the reflog, then maintained live.** On first use each log is stitched
   from the HEAD reflog (the tool's own labeled hops stripped) - so even cold, the
-  first `git undo` reverses your last real edit and `git undo -n` your last switch.
+  first `git undo` reverses your last real edit and `git back` your last switch.
   After that each maintains itself: the navigation log re-reads new checkouts from the
   reflog; an edit log samples its branch tip and stitches in new commits. No hooks, no
   daemon.
@@ -349,6 +315,9 @@ contributors.
   `git undo --worktree`), so it's a full reset of the tool's state; your current working tree
   is left as-is. Anything the reflog no longer reaches stays only in git's reflog until
   it expires. (Long flag only, by design, so it can't be triggered by accident.)
+- **Plays nice with `git worktree`.** The tool's state lives under each worktree's own git
+  directory, so every linked worktree keeps an independent undo/redo/navigation/parking
+  history - and `git undo --reset` only clears the worktree you run it in, never another's.
 - **No hooks, no daemon.** Each log catches up from the reflog when you run a command.
   The navigation log re-reads every checkout since last time (so even a switch-away-
   and-back is recorded); an edit log samples its branch tip and stitches in new commits
