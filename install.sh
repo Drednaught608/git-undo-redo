@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 #
 # Installer for git-undo-redo - works the same on macOS, Linux, and Windows
-# (Git-Bash / WSL). Installs three git subcommands: git undo, git redo, git take.
+# (Git-Bash / WSL). Installs four git subcommands: git undo, git redo, git take, git goto.
 # (Log/status are flags now: git undo --log / --status.)
 #
 # Usage:
@@ -28,7 +28,7 @@ set -euo pipefail
 SRC_URL="${GIT_UNDO_REDO_SRC:-https://raw.githubusercontent.com/Drednaught608/git-undo-redo/main/git-undo-redo}"
 BIN_DIR="${GIT_UNDO_REDO_BIN:-$HOME/.local/bin}"
 PRIMARY="git-undo"
-ALIASES=(git-redo git-take)
+ALIASES=(git-redo git-take git-goto)
 ALL=("$PRIMARY" "${ALIASES[@]}")
 # Commands shipped by older versions that this one no longer installs (oplog/opstatus
 # became `git undo --log` / `--status`). We delete these on install and uninstall so an

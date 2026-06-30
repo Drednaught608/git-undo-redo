@@ -21,8 +21,9 @@ two ways, then persisted to disk with a timestamp per entry so they outlive the 
 The **global** view (`-g`/`--global`) is a *third, derived* view: it merges the two
 durable logs by those timestamps into one chronological throughline and walks it,
 dispatching each step to its own axis - composed live at query time, never a third
-stored log. **Global is the default scope** for a bare command; `git config
-undoredo.scope` (global|edit|navigation; default global) changes it.
+stored log. **Edit is the default scope** for a bare command (use `-g`/`--global` for
+this composed view); `git config undoredo.scope` (edit|global|navigation; default edit)
+changes it.
 
 ## The model
 
@@ -107,9 +108,9 @@ undoredo.scope` (global|edit|navigation; default global) changes it.
 
 Four `git config` keys (read at runtime; per-invocation flags always override):
 
-- `undoredo.scope` = `global` | `edit` | `navigation` (default `global`) - the scope of
+- `undoredo.scope` = `edit` | `global` | `navigation` (default `edit`) - the scope of
   a bare `git undo` / `git redo` and their `--status`/`--log` views (each also takes
-  `-g`/`--global`, `-e`/`--edit`, and `-n`/`--navigation`).
+  `-e`/`--edit`, `-n`/`--navigation`, and `-g`/`--global`).
 - `undoredo.log` = `full` | `compact` (default `full`) - the default `git undo --log`
   density (`-c`/`-f` override).
 - `undoredo.take` = `unstaged` | `staged` (default `unstaged`) - whether `git take`
@@ -218,9 +219,10 @@ that undo/redo inherently produce (and which we strip back out on seed).
   reads a generic `TL_*` buffer that `_ou_show` copies the chosen log into. `-c` hides
   primes; `-i` is a picker (cursor move, no new op): an edit pick resets the branch and
   saves the edit cursor, a nav pick is one atomic checkout.
-- **reset** (`_ou_reset`, `git undo --reset`): delete the nav + per-branch logs and
-  keep-refs; the next command re-seeds from the live reflog. A rebuild, not a wipe
-  (re-deriving from the reflog *is* the model).
+- **reset** (`_ou_reset`, `git undo --reset`): delete the nav + per-branch logs,
+  keep-refs, AND the parked wip buckets + wipkeep refs (a full state clear); the next
+  command re-seeds the logs from the live reflog. A rebuild, not a wipe (re-deriving from
+  the reflog *is* the model); the working tree is left untouched.
 - Both seeds anchor their cursor on the *actual* HEAD/branch tip (not just the
   newest entry), so a prior tool hop that moved it back doesn't misplace it.
 

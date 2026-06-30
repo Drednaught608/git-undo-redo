@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>git-undo-redo - editor-style undo & redo for Git</title>
 <link rel="icon" type="image/svg+xml" href="logo.svg" />
-<meta name="description" content="git undo and git redo are Ctrl+Z / Ctrl+Y for git. git undo reverses your last change - a commit, an amend, even a bad git reset --hard - and your working tree follows; git redo re-applies it; git take keeps a commit's changes instead of reversing them. No new tool or workflow: it reads git's own reflog, never rewrites your branches or refs, and writes nothing outside .git/. One command to install on macOS, Linux, Windows." />
+<meta name="description" content="git undo and git redo are Ctrl+Z / Ctrl+Y for git. git undo reverses your last change - a commit, an amend, even a bad git reset --hard - and your working tree follows; git redo re-applies it; git take keeps a commit's changes instead of reversing them; git goto switches branches, parking your uncommitted work and restoring it when you return. No new tool or workflow: it reads git's own reflog, never rewrites your branches or refs, and writes nothing outside .git/. One command to install on macOS, Linux, Windows." />
 <script>
   /* Apply a saved explicit theme before paint so there's no flash. "auto" (or
      unset) leaves it to the OS via prefers-color-scheme. */
@@ -264,7 +264,7 @@
   <div class="wrap">
     <span class="eyebrow">↶ ↷ &nbsp;Ctrl+Z / Ctrl+Y for git</span>
     <h1><span class="g">git undo</span> and <span class="g">git redo</span>, just like your editor.</h1>
-    <p class="sub"><code>git undo</code> reverses your last change - a commit, an amend, even a bad <code>git reset --hard</code> - and your working tree follows. <code>git redo</code> re-applies it. Committed too soon? <code>git take</code> brings a commit's changes back so you can keep editing. No new tool, no new workflow: it reads git's own reflog, never rewrites your branches or refs, and writes nothing outside <code>.git/</code>.</p>
+    <p class="sub"><code>git undo</code> reverses your last change - a commit, an amend, even a bad <code>git reset --hard</code> - and your working tree follows. <code>git redo</code> re-applies it. Committed too soon? <code>git take</code> brings a commit's changes back so you can keep editing. <code>git goto</code> switches branches, parking your uncommitted work and restoring it when you return. No new tool, no new workflow: it reads git's own reflog, never rewrites your branches or refs, and writes nothing outside <code>.git/</code>.</p>
 
     <div class="install">
       <div class="cmd">
@@ -284,10 +284,10 @@
       <div class="term">
         <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">~/project - undo & redo, like Ctrl+Z / Ctrl+Y</span></div>
 <pre><span class="p">$</span> git undo                 <span class="c"># reverse your last commit (your files follow)</span>
-<span class="u">↶ Undo →</span> 5394925 Add login form on main  <span class="dim">(undo: 1 · redo: 1)</span>
+<span class="u">↶ Undo edit on main →</span> 5207efa Wire up validation  <span class="dim">(undo: 1 · redo: 1)</span>
 
 <span class="p">$</span> git redo                 <span class="c"># ...changed your mind</span>
-<span class="r">↷ Redo →</span> 5207efa Wire up validation on main  <span class="dim">(undo: 2 · redo: 0)</span></pre>
+<span class="r">↷ Redo edit on main →</span> 5394925 Add login form  <span class="dim">(undo: 2 · redo: 0)</span></pre>
       </div>
       <div class="term" style="margin-top:18px">
         <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">~/project - recover a bad reset --hard</span></div>
@@ -295,12 +295,12 @@
 HEAD is now at 8c7a0d5 Project skeleton
 
 <span class="p">$</span> git undo                 <span class="c"># ...back: commits and working tree restored</span>
-<span class="u">↶ Undo →</span> 5207efa Wire up validation on main  <span class="dim">(undo: 2 · redo: 1)</span></pre>
+<span class="u">↶ Undo edit on main →</span> 5394925 Add login form  <span class="dim">(undo: 2 · redo: 1)</span></pre>
       </div>
       <div class="term" style="margin-top:18px">
         <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">~/project - committed too early? keep the changes</span></div>
 <pre><span class="p">$</span> git undo                 <span class="c"># step back past the commit</span>
-<span class="u">↶ Undo →</span> 4d83dad Add parser on main  <span class="dim">(undo: 0 · redo: 1)</span>
+<span class="u">↶ Undo edit on main →</span> 4d83dad Add parser  <span class="dim">(undo: 0 · redo: 1)</span>
 
 <span class="p">$</span> git take                 <span class="c"># pull that work back into your tree to edit &amp; re-commit</span>
 <span class="ok">↥ Took the changes from ad92e07 wip: half-done refactor</span> - in your working tree (unstaged), edit and commit.</pre>
@@ -333,15 +333,16 @@ HEAD is now at 8c7a0d5 Project skeleton
   <div class="wrap">
     <div class="lede">
       <p class="kicker">The everyday surface</p>
-      <h2>Three commands cover it.</h2>
-      <p>Day to day it's just <code>git undo</code>, <code>git redo</code>, and <code>git take</code> - bare, no flags. Every command takes <code>-h</code> for help (use <code>-h</code>, not <code>--help</code>: git reserves <code>git &lt;cmd&gt; --help</code> for its own manual pages).</p>
+      <h2>Four commands cover it.</h2>
+      <p>Day to day it's <code>git undo</code>, <code>git redo</code>, and <code>git take</code> - bare, no flags - plus <code>git goto</code> to move between branches. Every command takes <code>-h</code> for help (use <code>-h</code>, not <code>--help</code>: git reserves <code>git &lt;cmd&gt; --help</code> for its own manual pages).</p>
     </div>
     <div class="cmds">
       <div class="crow"><div class="name">git <b>undo</b></div><div class="desc">Reverse your last change - a commit, an amend, even a bad <code>git reset --hard</code> - and your working tree follows. Like <kbd>Ctrl</kbd>+<kbd>Z</kbd>, but for git.</div></div>
       <div class="crow"><div class="name">git <b>redo</b></div><div class="desc">Re-apply what you just undid. Like <kbd>Ctrl</kbd>+<kbd>Y</kbd> - available until you do something new.</div></div>
       <div class="crow"><div class="name">git <b>take</b></div><div class="desc">Committed too early? Undo, then <code>git take</code> copies that commit's changes back into your files (unstaged) so you can edit and re-commit - instead of reversing them. <span class="mono">git take N</span> reaches N entries above you.</div></div>
+      <div class="crow"><div class="name">git <b>goto</b></div><div class="desc">A smarter <code>git switch</code>: change branches - create with <code>-c</code>, jump to a remote, every <code>git switch</code> option works - and your uncommitted work is parked when you leave and restored when you return (it waits where you left it, not on the new branch). No stash/pop, and your <code>git stash</code> stays untouched.</div></div>
     </div>
-    <p class="hint" style="margin-top:18px"><strong>Power users:</strong> finer scopes plus a browsable history and status - <code>git undo -e</code> (just this branch's edits), <code>git undo -n</code> (a branch switch), <code>git undo -g</code> (the global default, across both), <code>git undo N</code> for several at once, and <code>git undo --log</code> / <code>git undo --status</code> to look around (both also on <code>git redo</code>). These are optional; see <a href="#how">How it works</a> and the <a href="https://github.com/Drednaught608/git-undo-redo#command-reference">README</a>. Config keys: <code>git config undoredo.scope global|edit|navigation</code> sets the bare-command scope (default <code>global</code>); <code>undoredo.log full|compact</code> the <code>--log</code> density; <code>undoredo.take unstaged|staged</code> where <code>git take</code> lands; <code>undoredo.color auto|always|never</code> the color. Flags always override the config.</p>
+    <p class="hint" style="margin-top:18px"><strong>Power users:</strong> finer scopes plus a browsable history and status - <code>git undo -e</code> (just this branch's edits), <code>git undo -n</code> (a branch switch), <code>git undo -g</code> (across both edits and switches), <code>git undo N</code> for several at once, and <code>git undo --log</code> / <code>git undo --status</code> to look around (both also on <code>git redo</code>), plus <code>git undo --worktree</code> to step through the working-tree versions <code>git goto</code> parks. These are optional; see <a href="#how">How it works</a> and the <a href="https://github.com/Drednaught608/git-undo-redo#command-reference">README</a>. Config keys: <code>git config undoredo.scope edit|global|navigation</code> sets the bare-command scope (default <code>edit</code>); <code>undoredo.log full|compact</code> the <code>--log</code> density; <code>undoredo.take unstaged|staged</code> where <code>git take</code> lands; <code>undoredo.color auto|always|never</code> the color. Flags always override the config.</p>
   </div>
 </section>
 
@@ -354,15 +355,15 @@ HEAD is now at 8c7a0d5 Project skeleton
         <h2 style="font-size:clamp(28px,4vw,40px);letter-spacing:-0.03em;font-weight:850;margin:0 0 16px;">Quietly correct, in its own space.</h2>
         <p style="color:var(--muted);font-size:15px;margin:0 0 28px;max-width:54ch;">You never need any of this to use the tool - the three commands above are the whole everyday surface. This is the machinery underneath, for the curious: two durable logs plus a derived global view, with finer-grained scopes on top.</p>
         <ol class="steps">
-          <li><span class="n">1</span><div><h4>Two durable logs from one reflog</h4><p>Both logs are projected from git's HEAD reflog - edits per branch, switches as navigation - with the tool's own hops stripped, then persisted to disk with each entry's reflog event time. So even cold, the first <code>git undo</code> reverses your most recent operation across both - <code>git undo -e</code> just your last edit, <code>git undo -n</code> just your last switch - and they keep working after git expires the reflog, or a branch is deleted.</p></div></li>
-          <li><span class="n">2</span><div><h4>Atomic in each domain</h4><p>An edit undo is one reset of your branch; a navigation undo is one checkout back to where you were (recreating a deleted branch, never detaching unless you undo to a detached spot). Neither walks through the other, so <code>git undo N</code> is a direct jump. Each axis self-heals to where HEAD or the tip actually is, so the two stay orthogonal.</p></div></li>
-          <li><span class="n">3</span><div><h4>Global, merged by time</h4><p><code>git undo -g</code> merges the two durable logs by their stored event times into one chronological throughline, then walks it - dispatching each step to an edit reset or a nav checkout. It's derived on demand, never stored as a third log; only a cursor is kept. That's what makes the global view durable beyond the reflog.</p></div></li>
+          <li><span class="n">1</span><div><h4>Two durable logs from one reflog</h4><p>Both logs are projected from git's HEAD reflog - edits per branch, switches as navigation - with the tool's own hops stripped, then persisted to disk with each entry's reflog event time. So even cold, the first <code>git undo</code> reverses your most recent edit on the current branch - <code>git undo -n</code> just your last switch, <code>git undo -g</code> across both - and they keep working after git expires the reflog, or a branch is deleted.</p></div></li>
+          <li><span class="n">2</span><div><h4>One move at a time</h4><p>An edit undo is one reset of your branch; a branch-switch undo is one checkout back to where you were (recreating a deleted branch, never detaching unless you undo to a detached spot). Neither replays the other, so <code>git undo N</code> is a direct jump. Each log self-heals to where HEAD or the tip actually is, so the two stay independent.</p></div></li>
+          <li><span class="n">3</span><div><h4>Global, merged by time</h4><p><code>git undo -g</code> merges the two durable logs by their stored event times into one timeline, then steps through it - each step an edit reset or a branch checkout. It's built on demand, never stored as a third log; only a cursor is kept. That's what makes the global view durable beyond the reflog.</p></div></li>
           <li><span class="n">4</span><div><h4>Append-only with resume points</h4><p>Act after undoing and a <em>resume point</em> (marked <span class="mono">↻</span>) is appended before your new op, so undo lands where you carried on and the path you undid past is preserved.</p></div></li>
           <li><span class="n">5</span><div><h4>Protect everything</h4><p>Each state gets a keep-ref so git's garbage collector can never reclaim an undone or abandoned commit.</p></div></li>
         </ol>
       </div>
       <div class="term">
-        <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">inside .git/ - kept orthogonal</span></div>
+        <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">inside .git/ - kept separate</span></div>
 <pre><span class="c"># tracking, tucked away from your refs</span>
 .git/git-undo-redo/<span class="k">local</span>/&lt;branch&gt;/  <span class="dim">per-branch edit log + cursor</span>
 .git/git-undo-redo/<span class="k">nav</span>/            <span class="dim">navigation log + cursor</span>

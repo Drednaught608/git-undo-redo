@@ -7,10 +7,85 @@ Guidance for AI agents (and humans) working on this repo. Read
 `git-undo-redo` - undo/redo for git along its two axes, plus a derived global view. One
 bash script ([`git-undo-redo`](git-undo-redo)) that's a **multi-call binary**: it
 dispatches on `basename "$0"` and is installed (via [`install.sh`](install.sh)) symlinked
-or copied to `git-undo`, `git-redo`, `git-take` on `PATH`. The old `git-oplog` /
-`git-opstatus` commands were folded into `git undo`/`git redo` as the `--log`/`-l` and
+or copied to `git-undo`, `git-redo`, `git-take`, `git-goto` on `PATH`. The old `git-oplog`
+/ `git-opstatus` commands were folded into `git undo`/`git redo` as the `--log`/`-l` and
 `--status`/`-s` flags (with `-c`/`--compact` and `-f`/`--full` for log density); the
 removed names still dispatch to a one-line "moved to" hint (`_ou_moved_hint`).
+
+`git goto` (`git-goto`) is a thin `git switch` forwarder that parks/restores the dirty
+worktree (the work waits at the commit you leave; it is NOT carried onto the new branch). It
+snapshots the tracked dirty tree UP FRONT (`git stash create`, preserving the
+staged/unstaged split, so the user's stash stack is untouched), cleans, then `git switch
+"$@"`. Only on a **successful** switch does it record the park (`_ou_wip_park base snap` -
+the snapshot is passed in, not re-captured) against the commit left, and restore whatever
+was parked against the destination (`_ou_wip_apply`: `git stash apply --index`, degrading
+to a flat apply that stages per `undoredo.take` on conflict). On a **failed** switch it
+silently `_ou_wip_apply`s the exact up-front snapshot back onto the unchanged branch and
+records NO park - so a refused switch can never empty the worktree, leaves no `wip` trace,
+and prints no stash message. A **bare** `git goto` (no target) forwards straight to `git
+switch` and never parks (no auto-stash when nothing moves). A wip bucket is keyed by
+BRANCH + COMMIT, not commit alone: the id is `<commit>@<branch>`, built fork-free via
+`printf -v` by `_ou_wip_setid` (from known parts) and `_ou_wip_setcurid` (reads HEAD FRESH
+in ONE call - `git rev-parse HEAD --abbrev-ref HEAD` - never the cached `_OU_BRANCH`, since
+goto flips the branch mid-command). The `_ou_wip_before` path instead uses the already-cached
+`_OU_HEAD`/`_OU_BRANCH` (HEAD hasn't moved yet) for a zero-fork id. This branch-qualifying is
+what stops `git goto -c newbranch` (a new branch on the SAME commit) from pulling back the
+work you left on the old branch - that work stays under `(old-branch, commit)`. Snapshots are ordered per id in
+`.git/git-undo-redo/wip/<commit>@<branch>/timeline` and gc-protected under
+`refs/git-undo-redo/wipkeep/<sha>` - its own namespace from `keep/`, but `git undo --reset`
+clears BOTH (a full state reset; see `_ou_reset`). Untracked files are left in the worktree
+(they travel with a switch). `git goto -h` prints the tool's own help PLUS `git switch -h`'s
+option list relabeled `switch`->`goto` via `sed`, so the wrapper's reference stays current.
+If the up-front snapshot can't be created on a dirty tree, goto refuses before cleaning,
+so work is never lost.
+
+The same park/restore engine backs **undo/redo and the picker** (`_ou_wip_before` before
+a move, `_ou_wip_after` after): they no longer refuse on a dirty tree - the work is parked
+against the commit you leave and restored against wherever HEAD lands (destination on
+success, origin on a failed/cancelled move, so nothing strands). `_ou_require_clean` is no
+longer the gate for undo/redo - parking is - and survives only as `git take`'s check and
+the implicit "can't park -> refuse" fallback. Park happens AFTER the boundary/too-many
+checks (never on a no-op), and once per command (a multi-step `-g` walk parks/restores
+once, not per step).
+
+**Clean-tree versions.** Leaving a commit (via `goto`, undo/redo) with a CLEAN tree records
+a special `clean` sentinel version - but ONLY if that commit already has a timeline. This is
+what makes "left it clean -> return clean" hold: without it, restoring the latest parked
+version would resurrect a stale dirty state you'd discarded. A clean tree with NO existing
+timeline records nothing (never start a timeline from clean). The sentinel is the literal
+string `clean` in the timeline (not a sha): `_ou_wip_apply` treats it as a no-op (the caller
+already reset to HEAD), `_ou_wip_restore` lands clean with no message, `_ou_wip_cursor_loaded`
+calls it loaded iff the tree is currently clean, rows show "clean working tree", and it has no
+`wipkeep` ref (nothing to gc-protect). Dedup is literal for `clean`, by-tree otherwise.
+
+`git undo -w`/`git redo -w` (`--worktree`, a top-level undo/redo mode - NOT a scope like
+`-e`/`-n`/`-g`, and shown in the main help) walk the parked-worktree timeline for the
+current commit instead of moving HEAD (`_ou_wip_nav`), persisting the
+position in `.git/git-undo-redo/wip/<base>/cursor`. It first asks whether the cursor's
+version is actually in the worktree (`_ou_wip_cursor_loaded`: a fresh `git stash create`
+tree vs the cursor snapshot's tree). Two paths:
+- **Loaded** (got here via `goto` or a prior `--worktree`): step relative to the cursor.
+  Boundary/too-many checks mirror the HEAD scopes (refuse-on-overshoot, "Only N
+  earlier/newer parked version(s)"; never clamp).
+- **Not loaded** (e.g. a plain `git switch` landed here and never restored the parked
+  work, or there are live edits): don't step past what you can't see - `_ou_wip_stamp_live`
+  saves any live edits as a new tail (nothing lost), then `git undo -w` LOADS the latest
+  parked version (deeper counts step back from it); `git redo -w` just loads the latest.
+  This mirrors `git goto`'s park-what-you-leave / restore-what-you-land-on behavior for the
+  case where the auto-park hook never ran.
+
+All snapshot applies go through `_ou_wip_apply`: `git stash apply --index` to preserve the
+staged/unstaged split, degrading on an index conflict to a flat apply that then stages per
+`undoredo.take` (default unstaged) - the one case where the split can't be reproduced lands
+the way `git take` would. The `--worktree` mode also drives the views: `git undo --log -w`
+(`_ou_wip_show`), `--status -w` (`_ou_wip_status`), and `--interactive -w` (`_ou_wip_picker`,
+which loads a chosen version, stamping live edits first). Rows show `vN <short> <diffstat>`,
+`@` marks the version currently in the worktree (none after a plain switch).
+
+Auto-prune (`_ou_wip_prune`, fired after each successful park) is conservative: a wip
+bucket is removed only when its COMMIT (the part before `@` in the id) is unreachable from
+branches/tags/`keep` refs AND absent from `git reflog` (`_ou_wip_base_alive`) - i.e. git
+itself could no longer restore it. Anything still recoverable by reflog is kept.
 
 Two orthogonal logs, both seeded from git's **HEAD reflog** then **persisted to disk
 with a per-entry reflog event-time** (so they outlive the reflog): the per-branch **edit
@@ -22,8 +97,8 @@ navigation is one `checkout` (`_ou_nav_goto`). No walking in the per-axis case -
 single *mixed* global log needed it; splitting the axes removed the need and the
 checkout/edit ambiguity.
 
-The **global** view (`-g`/`--global`, shipped, and **the default scope** for a bare
-command) is a *third, derived* one: `_ou_global_derive`
+The **global** view (`-g`/`--global`) is a *third, derived* one (the **edit** scope is
+the default for a bare command - see `_ou_cfg_scope`): `_ou_global_derive`
 merges the two durable logs by their stored `ts` into one chronological throughline
 (dropping the nav origin + edit floors, keeping primes) and `_ou_global_walk` walks it,
 dispatching each step to an edit reset or a nav checkout - so `undo -g N` WALKS (the one
@@ -97,7 +172,13 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   user's reset). Before recording, sync re-anchors to the branch's pre-move tip (2nd
   reflog entry) so a reset after a global walk doesn't inject a spurious prime.
 - **Keep the surfaces in sync** when the command/flag surface changes: the script
-  help (`_ou_help_*`, `_ou_usage`), the README command table, and `index.html`.
+  help (`_ou_help_*`, `_ou_usage`), the README command table, and `index.html`. Undo/redo
+  help is **two-tier**: `git undo -h` shows `_ou_help_undo` (the everyday flags - N and the
+  views `-s`/`-l`/`-i`/`-c`/`-f`); `-h -a` / `-a` / `--advanced` shows `_ou_help_undo_full`
+  (the complete set, which ADDS the scopes `-e`/`-n`/`-g` and `--reset`). A pre-scan in
+  `git-undo`/`git-redo` routes between them. Keep BOTH tiers updated; the scopes and
+  `--reset` stay in the full tier only (that's the whole point - scopes are the perceived
+  complexity), while the views appear in both.
 - **Exit-code convention: `undo`/`redo`/`take` exit 0 iff the requested end-state is
   reached, 1 when it could not be.** A no-op that means "couldn't do what you asked" -
   at the oldest/newest boundary, asked for more steps than exist, or nothing left to take
@@ -113,7 +194,7 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
   oplog from the reflog (it does NOT wipe - re-deriving is the model; never anchor a
   single entry instead). `--status`/`--log`/`--interactive` are mutually exclusive views.
   No within-command duplicate short letters. Defaults:
-  `undoredo.scope` (global|edit|navigation; default global), `undoredo.log` (full|compact),
+  `undoredo.scope` (edit|global|navigation; default edit), `undoredo.log` (full|compact),
   `undoredo.take` (unstaged|staged), and `undoredo.color` (auto|always|never); flags
   override.
 - **Output color** is via the `C_*` vars set by `_ou_colors` (empty unless a TTY /
