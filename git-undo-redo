@@ -492,6 +492,7 @@ _ou_undo_nav() {
     [ "$count" = all ] && count=$avail              # 'all' -> as far back as the nav log goes
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to go back to: already at the oldest recorded position.${C_RESET}"
+        echo "${C_DIM}   Trying to undo an edit (a commit, reset, amend)? That's 'git undo'.${C_RESET}"
         return 1   # asked to move, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
@@ -518,6 +519,7 @@ _ou_redo_nav() {
     [ "$count" = all ] && count=$avail              # 'all' -> forward to the most recent position
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to go forward to: already at the most recent position.${C_RESET}"
+        echo "${C_DIM}   Trying to redo an edit? That's 'git redo'.${C_RESET}"
         return 1   # asked to move, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
@@ -1150,6 +1152,7 @@ _ou_undo_local() {
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to undo on branch $branch: already at its oldest edit.${C_RESET}"
         _ou_root_uncommit_hint "${LT_KIND[0]:-}"
+        echo "${C_DIM}   Trying to undo a branch switch instead? That's 'git back'.${C_RESET}"
         return 1   # asked to undo, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
@@ -1182,6 +1185,7 @@ _ou_redo_local() {
     [ "$count" = all ] && count=$avail              # 'all' -> forward to the most recent edit
     if [ "$avail" -le 0 ]; then
         echo "${C_ERR}🛑 Nothing to redo on branch $branch: already at its most recent edit.${C_RESET}"
+        echo "${C_DIM}   Trying to redo a branch switch instead? That's 'git forward'.${C_RESET}"
         return 1   # asked to redo, nothing moved: a no-op exits non-zero (like "too many")
     fi
     if [ "$count" -gt "$avail" ]; then
@@ -1309,11 +1313,12 @@ git undo - step back your most recent change, like Ctrl+Z for git.
 
 Usage: git undo [N | all] [-s | -l | -i] [-c | -f] [-w]
 
-Reverses your last change - a commit, an amend, even a bad 'git reset --hard' - and your
+Reverses your last edit - a commit, an amend, even a bad 'git reset --hard' - and your
 files follow. 'git redo' re-applies it; 'git take' keeps an undone commit's changes so
 you can re-edit. Any uncommitted work is parked as you move (it leaves the working tree)
 and restored when you return, so you needn't stash first - a change that disappears on
-undo comes back on redo.
+undo comes back on redo. Undo/redo are for edits; to step back through branch switches,
+that's 'git back' / 'git forward'.
 
   N | all           Undo N at once (e.g. 'git undo 3'), or 'all' to the oldest; refuses if over.
   -s, --status      Show where you are and how many undo/redo steps remain.
@@ -1324,7 +1329,6 @@ undo comes back on redo.
                     commit (parked by 'git goto' or a dirty undo) - without moving HEAD.
                     'git redo --worktree' steps forward; add -l/-s/-i to list or pick.
   -h                Show this help. '-h -a' adds -e/-g and --reset.
-                    (For branch navigation, see 'git back' / 'git forward'.)
 EOF
 }
 
@@ -1378,6 +1382,7 @@ Usage: git redo [N | all] [-s | -l | -i] [-c | -f] [-w]
 Re-applies what you just undid ('git redo 2' re-applies two). It stays available until
 you make a new change, so undoing is never a dead end. Uncommitted work is parked as you
 move and restored when you return - so a change that vanished on undo comes back here.
+Undo/redo are for edits; to move through branch switches, that's 'git back' / 'git forward'.
 
   N | all           Redo N at once (e.g. 'git redo 2'), or 'all' to the newest; refuses if over.
   -s, --status      Show where you are and how many undo/redo steps remain.
@@ -1388,7 +1393,6 @@ move and restored when you return - so a change that vanished on undo comes back
                     commit (parked by 'git goto' or a dirty undo) - without moving HEAD.
                     'git undo --worktree' steps back; add -l/-s/-i to list or pick.
   -h                Show this help. '-h -a' adds -e/-g and --reset.
-                    (For branch navigation, see 'git back' / 'git forward'.)
 EOF
 }
 
@@ -1472,7 +1476,8 @@ Usage: git forward [N | all] [-s | -l | -i] [-c | -f]
 
 Re-does a branch switch you stepped back from with 'git back' - one atomic checkout. Stays
 available until you make a new switch. Navigation only; your branch tips and edits are
-untouched. Uncommitted work is parked as you move and restored when you come back.
+untouched (use 'git redo' for those). Uncommitted work is parked as you move and restored
+when you come back.
 
   N | all           Go forward N (e.g. 'git forward 2'), or 'all' to the furthest; refuses if over.
   -s, --status      Show where you are and how many back/forward steps remain.

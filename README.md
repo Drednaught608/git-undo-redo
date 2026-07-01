@@ -199,20 +199,21 @@ and refuses, changing nothing, if there's nothing above you (or fewer than `N` c
 ## Advanced: branch navigation, and the combined view
 
 You can stop at the everyday commands - this section is for finer control, and most users
-never need it. There are two kinds of "undo": your **edits** on a branch, and your
-**branch switches**. Each has its own command, so neither yanks the other:
+never need it. Git moves two things independently: your **edits** on a branch (its commits)
+and your **position** (which branch you're on). So undo has two commands - the same split
+your editor and browser already use, where Ctrl+Z changes your work and Back changes where
+you are:
 
 - **`git undo` / `git redo`** step through this branch's *edits* (commit, reset, merge,
   rebase, amend), using that branch's own log. They only move the current branch's tip, so
-  you can hop to any branch and undo its last edit. `-e` states this default explicitly,
-  and `git undo 3` is just three undos.
+  you can hop to any branch and undo its last edit. `-e` states this default explicitly;
+  `git undo 3` is three undos.
 - **`git back` / `git forward`** step through your *branch switches / checkouts* - one
   atomic checkout back to where you were (a detached HEAD too). Navigation only: they never
   touch a branch tip or an edit. `git back N` jumps N; add `-s`/`-l`/`-i` to look first.
 
-Keeping them apart is the point: `git undo` never pulls you to another branch, and
-`git back` never rewrites a commit. Each moves in a single step (one reset, or one
-checkout), so it never replays unrelated history.
+So `git undo` never pulls you to another branch, and `git back` never rewrites a commit -
+and when either one hits a dead end, its message points you to the other.
 
 ```console
 $ git undo                       # this branch's last edit

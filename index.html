@@ -305,6 +305,14 @@ HEAD is now at 8c7a0d5 Project skeleton
 <span class="p">$</span> git take                 <span class="c"># pull that work back into your tree to edit &amp; re-commit</span>
 <span class="ok">↥ Took the changes from ad92e07 wip: half-done refactor</span> - in your working tree (unstaged), edit and commit.</pre>
       </div>
+      <div class="term" style="margin-top:18px">
+        <div class="term-bar"><span class="b"></span><span class="b"></span><span class="b"></span><span class="ttl">~/project - switched branches? undo the switch, not your work</span></div>
+<pre><span class="p">$</span> git goto feature         <span class="c"># move branches - dirty work parked for you, no stash</span>
+Switched to branch 'feature'
+
+<span class="p">$</span> git back                 <span class="c"># undo the switch itself - back where you were (edits untouched)</span>
+<span class="u">↶ Back →</span> on main  <span class="dim">(back: 1 · forward: 1)</span></pre>
+      </div>
     </div>
   </div>
 </div>
