@@ -47,7 +47,11 @@ success, origin on a failed/cancelled move, so nothing strands). `_ou_require_cl
 longer the gate for undo/redo - parking is - and survives only as `git take`'s check and
 the implicit "can't park -> refuse" fallback. Park happens AFTER the boundary/too-many
 checks (never on a no-op), and once per command (a multi-step `-g` walk parks/restores
-once, not per step).
+once, not per step). **Observable safety:** when a move parks REAL dirty work, `_ou_wip_before`
+records the file count in `_OU_PARKED`, and each mover then prints `_ou_parked_note` - "↜ Set
+aside your N uncommitted file(s) - 'git redo' brings them back" (the recovery verb is
+direction-correct per axis: redo/undo, forward/back, `redo -g`/`undo -g`). So the instant your
+changes leave the tree, the output says where they went; it stays silent on a clean tree.
 
 **Clean-tree versions.** Leaving a commit (via `goto`, undo/redo) with a CLEAN tree records
 a special `clean` sentinel version - but ONLY if that commit already has a timeline. This is
@@ -145,11 +149,14 @@ where HEAD/the tip actually is, so the three views stay orthogonal and correct a
 global walk or a manual `git` move.
 
 `git take` (`_ou_take`) copies a commit's full tree onto the worktree with **no**
-navigation (HEAD/cursor never move): bare = the branch's **latest** edit (top of its
-log), `git take N` = the commit N above current (`take 1` = closest). Lands **unstaged**
-by default (`_ou_take_apply`, `git restore [--staged] --worktree`); `-u`/`-s` or
-`undoredo.take` choose. Clean tree + non-detached HEAD. (The old `git undo --staged`/`-s`
-post-step was **removed**; "keep the changes" is now `git undo` then `git take`.)
+navigation (HEAD/cursor never move): bare = the **nearest real edit directly above** the
+cursor (start at `LCUR+1`, skip resets UP - "undo, then take" grabs the edit you stepped
+past); `git take all` = the branch's **latest** edit (top of its log, skipping a trailing
+reset - the old bare-take behavior); `git take N` = the entry N above current, counting every
+entry (`take 1` = closest, resets included). Lands **unstaged** by default (`_ou_take_apply`,
+`git restore [--staged] --worktree`); `-u`/`-s` or `undoredo.take` choose. Clean tree +
+non-detached HEAD. (The old `git undo --staged`/`-s` post-step was **removed**; "keep the
+changes" is now `git undo` then `git take`.)
 
 Every dispatcher first runs `"$@"` through `_ou_unbundle` (mapfile, `set -u`-guarded),
 which splits a single-dash, all-letters token like `-en` into `-e -n` - so short flags
@@ -157,10 +164,15 @@ bundle. A count stays a separate arg (`-e3` is left intact and stays "unknown"; 
 `-e 3`); long `--flags` and bare numbers pass through untouched.
 
 ## How to run / test
-- No build step. To exercise it: copy the script to the five `git-*` names in a
+- **Regression suite: `bash suite.sh`** (root of the repo; sections A-Z; `--list` to list; pass
+  section letters to run a subset, e.g. `bash suite.sh B U V`). It shims the binary onto `PATH`,
+  runs each section in its own `mktemp -d` repo, prints `TOTAL: N passed, M failed`, and exits
+  non-zero on any failure. Add a check to the matching `sec_X()` when you change behavior.
+  `.github/workflows/ci.yml` runs it on Linux + Windows for every push/PR.
+- No build step. To exercise by hand: copy the script to the seven `git-*` names in a
   temp dir on `PATH`, then drive it in throwaway repos (`git init` in a
   `mktemp -d`). The umbrella `git-undo-redo <cmd>` form also works for dev.
-- `bash -n git-undo-redo` to syntax-check.
+- `bash -n git-undo-redo` to syntax-check (the suite also does this at the end).
 - Interactive paths (`-i`) need a TTY; without a pty, verify their logic by
   invoking the internal helpers directly.
 

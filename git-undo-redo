@@ -56,7 +56,8 @@
 #            so undo from D lands on B' (where you resumed) -> C (preserved) -> B
 #            -> A. Nothing is lost.
 #   * take : `git take` copies a commit's files into the working tree without moving
-#            HEAD (bare = the branch's latest edit; `take N` = N entries above you).
+#            HEAD (bare = the nearest real edit just above the cursor; `take all` = the
+#            branch's latest edit; `take N` = N entries above you).
 #
 # The tool's own moves (reset and checkout) are labeled via GIT_REFLOG_ACTION, so a
 # git user sees self-describing `git-undo`/`git-redo` reflog lines and a re-seed
@@ -506,6 +507,7 @@ _ou_undo_nav() {
     else
         echo "${C_UNDO}↶ Back $count →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
     fi
+    _ou_parked_note "git forward"
     _ou_wip_after
 }
 
@@ -533,6 +535,7 @@ _ou_redo_nav() {
     else
         echo "${C_REDO}↷ Forward $count →${C_RESET} on $(_ou_nav_where "$NCUR")  $(_ou_nav_meter)"
     fi
+    _ou_parked_note "git back"
     _ou_wip_after
 }
 
@@ -818,6 +821,7 @@ _ou_undo_global() {
     _ou_global_walk $(( GCUR - count )) || { _ou_restore_failed; _ou_wip_after; return 1; }
     if [ "$count" -eq 1 ]; then echo "${C_UNDO}↶ Undo →${C_RESET} $(_ou_short)$(_ou_global_where)  $(_ou_global_meter)"
     else echo "${C_UNDO}↶ Undo $count operations →${C_RESET} $(_ou_short)$(_ou_global_where)  $(_ou_global_meter)"; fi
+    _ou_parked_note "git redo -g"
     _ou_wip_after
 }
 
@@ -837,6 +841,7 @@ _ou_redo_global() {
     _ou_global_walk $(( GCUR + count )) || { _ou_restore_failed; _ou_wip_after; return 1; }
     if [ "$count" -eq 1 ]; then echo "${C_REDO}↷ Redo →${C_RESET} $(_ou_short)$(_ou_global_where)  $(_ou_global_meter)"
     else echo "${C_REDO}↷ Redo $count operations →${C_RESET} $(_ou_short)$(_ou_global_where)  $(_ou_global_meter)"; fi
+    _ou_parked_note "git undo -g"
     _ou_wip_after
 }
 
@@ -1141,8 +1146,9 @@ _ou_undo_local() {
     local count="${1:-1}" d branch avail
     branch="$(_ou_branch)"
     if [ -z "$branch" ]; then
-        echo "${C_ERR}❌ Edit undo needs a branch, but HEAD is detached.${C_RESET}"
-        echo "   Run 'git back' to step back through your branch switches / checkouts instead."
+        echo "${C_ERR}❌ Edit undo needs a branch, but HEAD is detached at $(git rev-parse --short HEAD 2>/dev/null).${C_RESET}"
+        echo "   ${C_DIM}Commits here aren't tracked as edits - git keeps them, but 'git switch -c <name>'${C_RESET}"
+        echo "   ${C_DIM}pins them to a branch first. To step back through branch switches, use 'git back'.${C_RESET}"
         return 1
     fi
     d=$(_ou_local_dir)            || return 1
@@ -1166,6 +1172,7 @@ _ou_undo_local() {
     else
         echo "${C_UNDO}↶ Undo $count edits on ${C_RESET}${C_REDO}$branch${C_RESET}${C_UNDO} →${C_RESET} $(_ou_short)  $(_ou_local_meter)"
     fi
+    _ou_parked_note "git redo"
     _ou_wip_after
 }
 
@@ -1174,8 +1181,9 @@ _ou_redo_local() {
     local count="${1:-1}" d branch last avail
     branch="$(_ou_branch)"
     if [ -z "$branch" ]; then
-        echo "${C_ERR}❌ Edit redo needs a branch, but HEAD is detached.${C_RESET}"
-        echo "   Run 'git forward' to step forward through your branch switches instead."
+        echo "${C_ERR}❌ Edit redo needs a branch, but HEAD is detached at $(git rev-parse --short HEAD 2>/dev/null).${C_RESET}"
+        echo "   ${C_DIM}Commits here aren't tracked as edits - git keeps them, but 'git switch -c <name>'${C_RESET}"
+        echo "   ${C_DIM}pins them to a branch first. To step forward through branch switches, use 'git forward'.${C_RESET}"
         return 1
     fi
     d=$(_ou_local_dir)            || return 1
@@ -1199,15 +1207,17 @@ _ou_redo_local() {
     else
         echo "${C_REDO}↷ Redo $count edits on $branch →${C_RESET} $(_ou_short)  $(_ou_local_meter)"
     fi
+    _ou_parked_note "git undo"
     _ou_wip_after
 }
 
-# `git take` / `git take N`: copy a commit's changes into your files WITHOUT moving
-# HEAD or the cursor, reading THIS branch's edit log. Bare `git take` grabs the
-# branch's LATEST edit (the top of the log) - the common "I undid to look around,
-# now give me my newest work back" case, with no flag needed. `git take N` instead
-# reaches the commit N entries above the current point (so `take 1` is the closest
-# one above you). $1 = count ("" = latest), $2 = mode (staged|unstaged). Edit-based.
+# `git take` / `git take N` / `git take all`: copy a commit's changes into your files
+# WITHOUT moving HEAD or the cursor, reading THIS branch's edit log. Bare `git take` grabs
+# the nearest REAL edit directly above the cursor (skipping resets upward) - "undo, then
+# take" hands back the edit you just stepped past. `git take all` grabs the branch's LATEST
+# edit (top of the log, skipping a trailing reset) - the "give me my newest work back" case.
+# `git take N` reaches the commit N entries above (every entry counted, so `take 1` is the
+# closest). $1 = count ("" = nearest real edit, "all" = latest, N = Nth above), $2 = mode.
 _ou_take() {
     local count="$1" mode="${2:-unstaged}" branch d last avail target above
     branch="$(_ou_branch)"
@@ -1227,12 +1237,24 @@ _ou_take() {
         return 1   # asked to take, nothing to take: a no-op exits non-zero
     fi
     if [ -z "$count" ]; then
-        # Bare take = the branch's latest edit, but SKIP a trailing reset. A reset moves
-        # backward, so "take my newest work" landing on one would grab an OLDER state -
-        # the opposite of what take means, and there's no intentional use for it. Fall to
-        # the latest real edit above the cursor instead. (A commit sitting ABOVE a reset
-        # is still taken normally - that's deliberate forward work, not a bare reset; and
-        # an explicit `git take N` still counts every entry, resets included.)
+        # Bare take = the nearest REAL edit directly above the cursor. Start at the entry
+        # right above (LCUR+1) and skip UP past resets - a reset is a backward pointer move,
+        # not work to grab - until a real edit. So "undo, then take" grabs the edit you just
+        # stepped past. ('git take all' grabs the branch's LATEST edit; 'git take N' counts
+        # every entry, resets included.)
+        target=$(( LCUR + 1 ))
+        while [ "$target" -le "$last" ] && [ "${LT_KIND[$target]}" = reset ]; do
+            target=$(( target + 1 ))
+        done
+        if [ "$target" -gt "$last" ]; then
+            echo "${C_ERR}🛑 Nothing real to take above the current point on branch $branch - everything above it is a reset (a backward move).${C_RESET}"
+            echo "   ${C_DIM}'git take all' grabs the branch's latest edit; 'git take N' a specific one.${C_RESET}"
+            return 1
+        fi
+    elif [ "$count" = all ]; then
+        # 'git take all' = the branch's LATEST edit (top of the log), SKIPPING a trailing
+        # reset (a reset at the top would grab an OLDER state - the opposite of "take my
+        # newest work"). This is what bare 'git take' used to do.
         target=$last
         while [ "$target" -gt "$LCUR" ] && [ "${LT_KIND[$target]}" = reset ]; do
             target=$(( target - 1 ))
@@ -1285,7 +1307,8 @@ Commands (installed as git-undo, git-redo, git-take, git-goto, git-back, git-for
   git back        Step back through your branch switches (navigation undo) - 'git back N'
   git forward     and 'git forward' go the other way. The official way to undo a checkout.
   git take        Copy a commit's changes into your files without moving HEAD - e.g.
-                  'git undo' to look back, then 'git take' to pull your latest work in.
+                  'git undo' to look back, then 'git take' for the edit just above you
+                  ('git take all' for your latest work).
   git goto        Switch branches like 'git switch' without committing or stashing first -
                   your dirty changes are parked against the commit you leave (they go out of
                   the working tree) and restored when you return (your 'git stash' untouched).
@@ -1434,14 +1457,16 @@ _ou_help_take() {
     cat <<'EOF'
 git take - bring a commit's changes into your files, without moving HEAD.
 
-Usage: git take [N] [-u|--unstaged | -s|--staged] [-h]
+Usage: git take [N | all] [-u|--unstaged | -s|--staged] [-h]
 
 The "I committed too early" tool: 'git undo' to step back, then 'git take' to pull those
-changes into your working tree to edit and re-commit. Bare take grabs your latest work;
+changes into your working tree to edit and re-commit. Bare take grabs the nearest edit just
+above you (the one you stepped past, skipping resets); 'git take all' grabs your latest work;
 'git take N' grabs the commit N above you ('take 1' = closest). Lands UNSTAGED by default
 (or set 'git config undoredo.take'). Needs a clean working tree and a branch.
 
-  N               The commit N above current ('take 1' = closest); omit for latest.
+  N | all         The commit N above current ('take 1' = closest), or 'all' for your latest
+                  edit; bare take grabs the nearest real edit just above you (skips resets).
   -u, --unstaged  Land changes in the working tree, unstaged (the default).
   -s, --staged    Land them staged, ready to commit.
   -h              Show this help. (Use -h, not --help, which git intercepts.)
@@ -1668,6 +1693,7 @@ git-take() {
             -s|--staged)      mode=staged ;;
             -u|--unstaged)    mode=unstaged ;;
             *)  case "$1" in
+                    [Aa][Ll][Ll]) count=all ;;          # 'all' = the branch's latest edit (old bare-take)
                     ''|*[!0-9]*) echo "${C_ERR}Unknown option: $1${C_RESET}" >&2; echo >&2; _ou_help_take >&2; return 2 ;;
                     *)           count=$((10#$1)) ;;     # bare number = the Nth entry above current
                 esac ;;
@@ -1675,7 +1701,7 @@ git-take() {
         shift
     done
     _ou_require_repo || return 1
-    [ -n "$count" ] && [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to take (0 requested).${C_RESET}"; return 0; }
+    [ -n "$count" ] && [ "$count" != all ] && [ "$count" -lt 1 ] && { echo "${C_DIM}Nothing to take (0 requested).${C_RESET}"; return 0; }
     [ -z "$mode" ] && mode=$(_ou_cfg_take)   # no flag: follow undoredo.take (default unstaged)
     _ou_take "$count" "$mode"
 }
@@ -1854,6 +1880,13 @@ _ou_wip_before() {
         # from a clean tree - there'd be nothing to come back to.
         [ -s "$tl" ] || return 0
         snap=clean
+    else
+        # Real dirty work is about to leave the tree - count it, so the mover can SAY so
+        # (observable safety: the instant your changes vanish, the output tells you where).
+        # Count from `git status` (tracked changes, staged AND unstaged) - that's exactly what
+        # the stash parks. Diffing HEAD against the stash's *tree* would miss index-only changes
+        # (staged, then the worktree reverted), so they'd park silently. `git status` sees both.
+        _OU_PARKED=$(git status --porcelain --untracked-files=no 2>/dev/null | grep -c .)
     fi
     if ! _ou_wip_park "$base" "$snap"; then
         echo "${C_ERR}❌ Couldn't safely save your uncommitted changes - not moving.${C_RESET}" >&2
@@ -1867,6 +1900,15 @@ _ou_wip_after() {
     # skip the HEAD lookup entirely. This is the common case (most users never goto/park).
     [ -d "${_OU_SDIR:-$(_ou_state_dir)}/wip" ] || return 0
     local h; _ou_wip_setcurid h && _ou_wip_restore "$h"   # restore whatever's parked for where we landed
+}
+
+# After a dirty undo/redo/back/forward set your live work aside (via _ou_wip_before), say so:
+# where it went and the single command that brings it back. Answers the "where did my changes
+# go?" panic in one line, in the moment. $1 = the command that returns you to it. No-op when
+# nothing dirty was parked.
+_ou_parked_note() {
+    [ "${_OU_PARKED:-0}" -gt 0 ] || return 0
+    echo "${C_OK}↜ Set aside your $(_ou_qty "$_OU_PARKED" "uncommitted file")${C_RESET} ${C_DIM}- '$1' brings them back.${C_RESET}"
 }
 
 # Worktree-version navigation (the `-w`/`--worktree` mode): step through a commit's parked

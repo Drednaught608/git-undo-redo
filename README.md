@@ -2,6 +2,8 @@
 
 # git-undo-redo
 
+[![CI](https://github.com/Drednaught608/git-undo-redo/actions/workflows/ci.yml/badge.svg)](https://github.com/Drednaught608/git-undo-redo/actions/workflows/ci.yml)
+
 **`git undo` and `git redo` are <kbd>Ctrl</kbd>+<kbd>Z</kbd> /
 <kbd>Ctrl</kbd>+<kbd>Y</kbd> for git.** `git undo` reverses your last change - a commit,
 an amend, even a bad `git reset --hard` - and your working tree follows. `git redo`
@@ -106,8 +108,8 @@ status - is optional power, summarized here and explained under **Advanced** bel
 | `git forward` / `git forward N` | Re-do a branch switch you stepped back from with `git back` - the navigation counterpart to `git redo`. |
 | `git undo -g` / `--global` | **Advanced.** Undo your single most recent change across **both** your edits and your branch switches, whichever came last - one combined timeline. A step can move you to another branch (the message says where you land). |
 | `git undo N` / `git back N` ... | Do `N` at once (e.g. `git undo 3`). Refuses and reports how many are available if `N` is too many. Use `all` instead of a number (`git undo all`, `git redo all`, `git back all`, `git forward all`) to go as far as that direction allows - to the oldest/newest point. |
-| `git take` | Copy the branch's **latest** edit (the top of the edit log) into your files **without moving** `HEAD` - the common flow is `git undo` to look back, then `git take` to pull your newest work in. Lands unstaged by default. Edit-based (reads the current branch's log); needs a clean tree and a branch. |
-| `git take N` | Reach the commit `N` entries above your current point (so `git take 1` is the closest one above you, `git take 2` further up). Applies that commit's full tree wholesale. Refuses, changing nothing, if there are fewer than `N` commits above you. |
+| `git take` | Copy the **nearest edit just above where you are** (the one you stepped past; resets are skipped) into your files **without moving** `HEAD` - the common flow is `git undo` to look back, then `git take` to pull that work in. `git take all` grabs the branch's **latest** edit instead. Lands unstaged by default. Edit-based (reads the current branch's log); needs a clean tree and a branch. |
+| `git take N` / `git take all` | `git take N` reaches the commit `N` entries above your current point (so `git take 1` is the closest, `git take 2` further up), counting every entry; `git take all` grabs your latest edit. Applies that commit's full tree wholesale. Refuses, changing nothing, if there are fewer than `N` above you. |
 | `git goto <branch>` | `git switch` that handles your uncommitted work for you instead of refusing. Parks your dirty **tracked** files (staged **and** unstaged) against the commit you leave - they leave the working tree - switches, then restores whatever you'd parked against the commit you land on, no manual stash/pop. Your work waits where you left it (not on the new branch); per-commit, so changes left against different commits each come back where you left them. Untracked files travel with the switch as usual; your `git stash` stack is never touched. All `git switch` options pass through. |
 | `git undo --status` / `-s` | Show the current `HEAD` and how many undo / redo steps remain, for the current branch's edits (default) or across everything (`-g`). Read-only; `git redo --status` shows the same. (`git back --status` for branch navigation.) |
 | `git undo --log` / `-l` | Show the current branch's **edit log**, newest first, with `@` marking where you are; `-g`/`--global` shows the combined log. (`-c`/`--compact` hides resume points (↻); `-f`/`--full` is the default.) Read-only. (`git back --log` shows the navigation log.) |
@@ -184,14 +186,15 @@ $ git take
 ↥ Took the changes from b0577c0 Refactor parser - in your working tree (unstaged), edit and commit.
 ```
 
-Bare `git take` copies the branch's **latest** edit (the top of the edit log) into your
-files, without moving `HEAD`. (It skips a trailing **reset** - a reset moves backward, so
-taking it would grab an older state - and uses the latest real edit instead; a commit
-above a reset is still taken normally.) The changes land **unstaged** by default (ordinary
-working-tree edits); `-s`/`--staged` stages them instead, and `git config undoredo.take`
-(`unstaged` | `staged`) sets the default. `git take N` reaches the commit `N` entries
-above your current point (so `git take 1` is the closest one above you, `git take 2`
-further up) and applies its files *wholesale* (the full snapshot - so only files that
+Bare `git take` copies the **nearest edit just above where you are** - the one you stepped
+past - into your files, without moving `HEAD`. (It skips **resets** on the way up - a reset
+moves backward, so taking one would grab an older state - and grabs the nearest real edit
+instead.) `git take all` grabs the branch's **latest** edit instead (the top of the log,
+also skipping a trailing reset) - the "give me my newest work back" case. The changes land
+**unstaged** by default (ordinary working-tree edits); `-s`/`--staged` stages them instead,
+and `git config undoredo.take` (`unstaged` | `staged`) sets the default. `git take N` reaches
+the commit `N` entries above your current point, counting every entry (so `git take 1` is the
+closest one above you, `git take 2` further up) and applies its files *wholesale* (the full snapshot - so only files that
 actually differ from where you are show up, you get that commit's version of each rather
 than any in-between one, and deletions are handled). It needs a clean tree and a branch,
 and refuses, changing nothing, if there's nothing above you (or fewer than `N` commits).
@@ -337,12 +340,33 @@ reflog. **Neither loses data** - git's own reflog still backstops what falls out
   moves up going forward.) The commits themselves are safe in git's reflog.
 - **A commit made on a detached `HEAD` isn't tracked.** It moved `HEAD` but no branch
   tip, so it belongs to no branch's edit log and isn't a navigation either. It's a rare,
-  advanced case; the commit stays in git's reflog (and `git checkout -b` from it brings
-  it back).
+  advanced case; the commit stays in git's reflog. Rather than fail silently, `git undo` /
+  `git redo` **say so at runtime** - they show the detached sha and that `git switch -c <name>`
+  pins the work to a branch - so a spoken boundary, not a trap.
 
 (Two things that *used* to be listed here are now handled: undo reverting your working
 tree is covered by `git take`, and a between-command switch-away-and-back is now read
 straight from the reflog by the navigation log.)
+
+## Tests
+
+The "nothing is ever lost" promise is load-bearing, so it's proven, not just asserted. A
+self-contained regression suite exercises the ugly cross-product - dirty vs. clean trees,
+detached `HEAD`, amend/reset/merge, resume-point primes, parked-worktree versions, multiple
+`git worktree`s, `--reset` rebuilds, the `all` jumps, and more - and runs in
+[CI](.github/workflows/ci.yml) on Linux and Windows on every push and PR.
+
+**Want to verify it yourself?** From a clone, just run the suite (needs `bash` and `git` -
+nothing else to install):
+
+```bash
+bash suite.sh            # run everything; prints "TOTAL: N passed, 0 failed", exits non-zero on any failure
+bash suite.sh B U V      # run only some sections
+bash suite.sh --list     # list the sections
+```
+
+It shims the tool onto your `PATH` inside a temp dir and spins up a throwaway repo per section -
+so it never touches your real repos or global git config, and any subset runs standalone.
 
 ## Uninstall
 

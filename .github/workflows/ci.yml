@@ -1,0 +1,25 @@
+name: CI
+
+# Proves the load-bearing invariant - "nothing is ever lost" - on every push and PR, across
+# the two environments the tool ships GNU tooling on (Linux and Windows Git-Bash). The suite
+# is self-contained: it shims the binary onto PATH and runs each section in its own temp repo,
+# so no install step or global git config is needed. It exits non-zero on any failing check.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  suite:
+    name: suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the test suite
+        shell: bash          # windows-latest -> Git-Bash (bash 4+, GNU sed/grep), matching Linux
+        run: bash suite.sh

@@ -1,0 +1,7 @@
+# Shell scripts and the multi-call binary MUST be LF on every platform - a CRLF line ending
+# breaks bash on Linux (stray $'\r' tokens, a broken shebang), which would fail the CI Linux
+# job and any Linux install. Force LF regardless of the contributor's core.autocrlf.
+git-undo-redo   text eol=lf
+install.sh      text eol=lf
+*.sh            text eol=lf
+*.yml           text eol=lf
